@@ -39,12 +39,7 @@
 
 ## 🖥️ Claw AI Lab Dashboard
 
-<p align="center">
-  <img src="assets/ui.png" width="860" alt="Claw AI Lab UI"/>
-  <br/>
-  <b>Launch projects, monitor agents, and inspect every artifact — all from a single interface.</b><br>
-  <sub>Real-time event stream · Multi-project overview · One-click rollback & resume · Artifact inspector</sub>
-</p>
+Launch projects, monitor agents, and inspect every artifact — all from a single interface. Real-time event stream · Multi-project overview · One-click rollback & resume · Artifact inspector.
 
 ---
 
@@ -64,26 +59,8 @@
 
 Each project autonomously produces a full research deliverable: **Paper** · **Code** · **Figures** · **Experiment Logs**
 
-<table width="100%">
-<tr>
-<td align="center" width="50%">
-<a href="assets/showcase/showcase-quantify-hallucination.md"><b>OATH: Quantifying Video Hallucination via Occlusion Debt</b></a><br>
-<sub>Lab Explore · CV · Video Generation Evaluation</sub><br><br>
-<a href="assets/showcase/showcase-quantify-hallucination.md"><img src="assets/showcase/quantifying-hallucination/stage-22/figures/oath_pipeline_overview.png" width="380"></a><br>
-<sub>Best method achieves <b>0.1714</b> primary error vs CLIP-T baseline <b>0.2393</b> (↓28%)</sub>
-</td>
-<td align="center" width="50%">
-<a href="assets/showcase/showcase-reproduce-phycustom-on-flux.md"><b>Reproducing PhyCustom on FLUX</b></a><br>
-<sub>Reproduce · Image Gen · Multi-Concept Customization</sub><br><br>
-<a href="assets/showcase/showcase-reproduce-phycustom-on-flux.md"><img src="assets/showcase/reproduce-phycustom/stage-22/figures/method_flip_pipeline_overview.png" width="380"></a><br>
-<sub>5 methods × 3 seeds = 15 runs; output-space decoupling edges at <b>0.2813</b></sub>
-</td>
-</tr>
-<!-- <tr>
-<td align="center"><img src="assets/showcase/quantifying-hallucination/stage-22/latex_package/figures/fig_main_comparison.png" width="360"><br><sub>Main comparison across 19 conditions</sub></td>
-<td align="center"><img src="assets/showcase/reproduce-phycustom/stage-22/latex_package/figures/fig_main_comparison.png" width="360"><br><sub>Main comparison across 5 methods</sub></td>
-</tr> -->
-</table>
+- **[OATH: Quantifying Video Hallucination via Occlusion Debt](assets/showcase/showcase-quantify-hallucination.md)** — Lab Explore · CV · Video Generation Evaluation. Best method achieves **0.1714** primary error vs CLIP-T baseline **0.2393** (↓28%).
+- **[Reproducing PhyCustom on FLUX](assets/showcase/showcase-reproduce-phycustom-on-flux.md)** — Reproduce · Image Gen · Multi-Concept Customization. 5 methods × 3 seeds = 15 runs; output-space decoupling edges at **0.2813**.
 
 ---
 
