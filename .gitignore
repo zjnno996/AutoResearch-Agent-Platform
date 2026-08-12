@@ -1,0 +1,79 @@
+# ── Runtime ──
+logs/
+.pids/
+.runtime_ports
+.vite/
+backend/runs/
+backup/
+
+# ── Frontend ──
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+.eggs/
+dist/
+build/
+*.whl
+
+# ── Backend agent ──
+backend/agent/*.egg-info/
+backend/agent/artifacts/
+backend/agent/docs/kb/
+backend/agent/deliverables/
+backend/agent/.claude
+backend/agent/.researchclaw_cache
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Env / Secrets ──
+.env
+.env.*
+*.key
+
+# ── Archives ──
+*.zip
+*.tar.gz
+backend/codebases/
+backend/datasets/
+backend/checkpoints/
+backend/shared_results/
+
+
+# TO DELETE
+config_opencode_freecustom_test.yaml
+submit_opencode_test.py
+.log
+
+homepage/
+.aider.chat.history.md
+.aider.input.history
+
+# ── Runtime artifacts / local data (excluded from public repo) ──
+data/
+outputs/
+backend/eval_cache/
+backend/agent/runs/
+backend/review_history/
+runs/
+.researchclaw_cache/
+How To Do Research.pdf
+
+# ── Node (frontend-web) ──
+frontend-web/node_modules/
+frontend-web/dist/

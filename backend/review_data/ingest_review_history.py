@@ -1,0 +1,211 @@
+"""Ingest review_history JSON files into few-shot examples.
+
+Reads all completed reviews from backend/review_history/, converts each
+dimension-level result into a _make() call, and writes them to
+review_history_examples.py (imported by the RAG engine).
+
+Usage:
+    python3 -m review_data.ingest_review_history
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = SCRIPT_DIR.parent
+ROOT_DIR = BACKEND_DIR.parent
+HISTORY_DIR = ROOT_DIR / "backend" / "review_history"
+OUTPUT_FILE = SCRIPT_DIR / "review_history_examples.py"
+
+
+def _escape(s: str) -> str:
+    """Escape string for Python source inclusion."""
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "")
+
+
+def _make_call(
+    dim_id: str,
+    score_100: int,
+    summary: str,
+    strengths: list[str],
+    weaknesses: list[str],
+    suggestions: list[str],
+    file_name: str,
+    model: str,
+) -> str:
+    """Generate a _make() call string."""
+    score_10 = max(1, round(score_100 / 10))
+    s_list = ",\n        ".join(f'"{_escape(s)}"' for s in strengths[:3])
+    w_list = ",\n        ".join(f'"{_escape(w)}"' for w in weaknesses[:3])
+    sug_list = ",\n        ".join(f'"{_escape(s)}"' for s in suggestions[:3])
+
+    # Pad to ensure exactly 3 items each
+    pad = '"See paper for details"'
+    if strengths[:3]:
+        s_pad = pad if len(strengths) < 2 else ""
+    else:
+        s_pad = f"{pad},\n        {pad},\n        {pad}"
+    # Actually let's just handle by ensuring at least 3
+    s_items = strengths[:3] if strengths else []
+    while len(s_items) < 3:
+        s_items.append("See paper for details")
+    w_items = weaknesses[:3] if weaknesses else []
+    while len(w_items) < 3:
+        w_items.append("See paper for details")
+    sug_items = suggestions[:3] if suggestions else []
+    while len(sug_items) < 3:
+        sug_items.append("See paper for details")
+
+    s_str = ",\n        ".join(f'"{_escape(s)}"' for s in s_items)
+    w_str = ",\n        ".join(f'"{_escape(w)}"' for w in w_items)
+    sug_str = ",\n        ".join(f'"{_escape(s)}"' for s in sug_items)
+
+    return (
+        f'    _make(\n'
+        f'        dim_id="{dim_id}",\n'
+        f'        score={score_10},\n'
+        f'        summary="{_escape(summary[:300])}",\n'
+        f'        strengths=[\n'
+        f'            {s_str},\n'
+        f'        ],\n'
+        f'        weaknesses=[\n'
+        f'            {w_str},\n'
+        f'        ],\n'
+        f'        suggestions=[\n'
+        f'            {sug_str},\n'
+        f'        ],\n'
+        f'        paper_title="{_escape(file_name[:80])}",\n'
+        f'        paper_venue="auto-review",\n'
+        f'    ),'
+    )
+
+
+def main() -> int:
+    history_files = sorted(HISTORY_DIR.glob("*.json"))
+    if not history_files:
+        print(f"No review history files found in {HISTORY_DIR}")
+        return 0
+
+    # Group examples by dimension
+    dim_examples: dict[str, list[str]] = {
+        "methodology": [],
+        "novelty": [],
+        "experiment": [],
+        "writing": [],
+        "related_work": [],
+        "reproducibility": [],
+        "ethics": [],
+    }
+    total = 0
+    skipped = 0
+
+    for fpath in history_files:
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"  SKIP {fpath.name}: {e}")
+            skipped += 1
+            continue
+
+        file_name = data.get("fileName", "unknown")
+        model = data.get("model", "unknown")
+        results = data.get("results") or []
+        overall_score = data.get("overallScore", 0)
+
+        # Skip low-quality results (empty or all failures)
+        valid_results = [
+            r for r in results
+            if r.get("score", 0) > 0
+            and r.get("summary")
+            and len(r.get("strengths") or []) > 0
+        ]
+        if not valid_results:
+            skipped += 1
+            continue
+
+        for r in valid_results:
+            dim_id = r.get("dimensionId", "")
+            if dim_id not in dim_examples:
+                continue
+            call = _make_call(
+                dim_id=dim_id,
+                score_100=r.get("score", 50),
+                summary=r.get("summary", ""),
+                strengths=r.get("strengths", []),
+                weaknesses=r.get("weaknesses", []),
+                suggestions=r.get("suggestions", []),
+                file_name=file_name,
+                model=model,
+            )
+            dim_examples[dim_id].append(call)
+            total += 1
+
+    if total == 0:
+        print("No valid examples found in review history.")
+        return 0
+
+    # Write output file
+    lines = [
+        '"""Few-shot examples derived from review_history.',
+        "",
+        f"Auto-generated by ingest_review_history.py — {total} examples",
+        f"from {len(history_files)} review history files.",
+        '"""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "from .schema import Review",
+        "from .fewshot_library import _make",
+        "",
+    ]
+
+    for dim_id, calls in dim_examples.items():
+        if not calls:
+            continue
+        label = dim_id.replace("_", " ").title()
+        lines.append(f"# ==============================================================================")
+        lines.append(f"# {label} ({len(calls)} examples)")
+        lines.append(f"# ==============================================================================")
+        var_name = f"{dim_id.upper()}_HISTORY_EXAMPLES"
+        lines.append(f"{var_name} = [")
+        lines.extend(calls)
+        lines.append("]")
+        lines.append("")
+
+    lines.append("# ==============================================================================")
+    lines.append("# Combined")
+    lines.append("# ==============================================================================")
+    lines.append("")
+    lines.append("REVIEW_HISTORY_EXAMPLES: dict[str, list[Review]] = {")
+    for dim_id, calls in dim_examples.items():
+        if calls:
+            var_name = f"{dim_id.upper()}_HISTORY_EXAMPLES"
+            lines.append(f'    "{dim_id}": {var_name},')
+        else:
+            lines.append(f'    "{dim_id}": [],')
+    lines.append("}")
+    lines.append("")
+
+    lines.append("def get_history_examples() -> list[Review]:")
+    lines.append('    """Get all review-history-derived examples."""')
+    lines.append("    all_examples: list[Review] = []")
+    lines.append("    for examples in REVIEW_HISTORY_EXAMPLES.values():")
+    lines.append("        all_examples.extend(examples)")
+    lines.append("    return all_examples")
+    lines.append("")
+
+    OUTPUT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Written: {OUTPUT_FILE}")
+    print(f"Total examples: {total}")
+    for dim_id, calls in dim_examples.items():
+        print(f"  {dim_id}: {len(calls)}")
+    print(f"Skipped files: {skipped}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

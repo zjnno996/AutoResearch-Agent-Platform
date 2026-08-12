@@ -1,0 +1,1493 @@
+"""Claw-code agentic turn loop for experiment code generation.
+
+Ported from claw-code ``rust/crates/runtime/src/conversation.rs``
+``ConversationRuntime::run_turn()``. The loop:
+
+    user_message → (LLM call → tool execution →)* → done
+
+The LLM receives tools via the API ``tools`` field and returns
+``tool_use`` content blocks. Each tool call is executed, and the result
+is fed back as a ``tool`` role message for the next iteration.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+import urllib.error
+import urllib.request
+import yaml
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from researchclaw.pipeline.codegen.session import CodegenSession
+from researchclaw.pipeline.claw_engine.tools.definitions import TOOL_SPECS
+from researchclaw.pipeline.claw_engine.tools.executor import ToolExecutor
+from researchclaw.pipeline.claw_engine.tools.permissions import SandboxPermissionPolicy
+from researchclaw.pipeline.codegen.types import CodegenPhase, GeneratedFiles
+
+logger = logging.getLogger(__name__)
+
+MAX_ITERATIONS = 40
+MAX_RESULT_CHARS = 8000
+
+
+@dataclass
+class TurnResult:
+    """Result of a complete turn loop execution."""
+    files: GeneratedFiles = field(default_factory=dict)
+    iterations: int = 0
+    tool_calls: int = 0
+    errors: list[str] = field(default_factory=list)
+    final_text: str = ""
+    elapsed_sec: float = 0.0
+
+
+class _TraceLog:
+    """Step-by-step trace logger for debugging code generation.
+
+    Writes a human-readable markdown file (``generation_trace.md``)
+    showing every LLM call, tool invocation, input/output, and file
+    change in chronological order — like a git log for code generation.
+    """
+
+    def __init__(self, trace_dir: Path) -> None:
+        self._path = trace_dir / "generation_trace.md"
+        self._step = 0
+        self._write("# Code Generation Trace\n")
+        self._write(f"Started: {datetime.now(timezone.utc).isoformat()}\n")
+
+    def iteration_start(self, i: int, total: int) -> None:
+        self._step += 1
+        self._write(f"\n---\n## Iteration {i}/{total}  (step {self._step})\n")
+
+    def llm_request(self, n_messages: int, n_tools: int, model: str) -> None:
+        self._write(
+            f"### LLM Request\n"
+            f"- Model: `{model}`\n"
+            f"- Messages in context: {n_messages}\n"
+            f"- Tools available: {n_tools}\n"
+        )
+
+    def llm_response(self, text: str, tool_calls: list[dict], tokens: dict | None) -> None:
+        self._write("### LLM Response\n")
+        if tokens:
+            self._write(
+                f"- Prompt tokens: {tokens.get('prompt_tokens', '?')}\n"
+                f"- Completion tokens: {tokens.get('completion_tokens', '?')}\n"
+            )
+        if text:
+            preview = text[:500] + ("..." if len(text) > 500 else "")
+            self._write(f"**Text** ({len(text)} chars):\n```\n{preview}\n```\n")
+        if tool_calls:
+            self._write(f"**Tool calls**: {len(tool_calls)}\n")
+        else:
+            self._write("**No tool calls** — generation complete.\n")
+
+    def tool_call(
+        self, name: str, input_data: dict, result: str, is_error: bool, elapsed_ms: int
+    ) -> None:
+        status = "ERROR" if is_error else "OK"
+        self._write(f"\n#### Tool: `{name}` [{status}] ({elapsed_ms}ms)\n")
+
+        # Log input
+        if name == "bash":
+            cmd = input_data.get("command", "")
+            self._write(f"**Command:**\n```bash\n{cmd}\n```\n")
+        elif name == "write_file":
+            path = input_data.get("path", "?")
+            content = input_data.get("content", "")
+            n_lines = len(content.splitlines())
+            self._write(f"**Path:** `{path}` ({n_lines} lines, {len(content)} chars)\n")
+            preview = content[:800] + ("\n... [truncated]" if len(content) > 800 else "")
+            self._write(f"```python\n{preview}\n```\n")
+        elif name == "edit_file":
+            path = input_data.get("path", "?")
+            old = input_data.get("old_string", "")[:200]
+            new = input_data.get("new_string", "")[:200]
+            self._write(
+                f"**Path:** `{path}`\n"
+                f"**old_string:** `{old}`\n"
+                f"**new_string:** `{new}`\n"
+            )
+        elif name == "read_file":
+            self._write(f"**Path:** `{input_data.get('path', '?')}`\n")
+        elif name in ("glob_search", "grep_search"):
+            self._write(f"**Pattern:** `{input_data.get('pattern', '?')}`\n")
+            if input_data.get("path"):
+                self._write(f"**In:** `{input_data['path']}`\n")
+
+        # Log result
+        result_preview = result[:1000] + ("\n... [truncated]" if len(result) > 1000 else "")
+        self._write(f"**Result:**\n```\n{result_preview}\n```\n")
+
+    def permission_denied(self, name: str, reason: str) -> None:
+        self._write(f"\n#### Tool: `{name}` [DENIED]\n**Reason:** {reason}\n")
+
+    def iteration_end(self, files_in_workspace: list[str]) -> None:
+        if files_in_workspace:
+            self._write(
+                f"\n**Workspace files after this iteration:** "
+                f"{', '.join(f'`{f}`' for f in files_in_workspace)}\n"
+            )
+
+    def loop_end(self, result: TurnResult) -> None:
+        self._write(
+            f"\n---\n## Summary\n"
+            f"- Iterations: {result.iterations}\n"
+            f"- Tool calls: {result.tool_calls}\n"
+            f"- Files produced: {sorted(result.files.keys())}\n"
+            f"- Errors: {len(result.errors)}\n"
+            f"- Elapsed: {result.elapsed_sec:.1f}s\n"
+        )
+        if result.errors:
+            self._write("### Errors\n")
+            for e in result.errors:
+                self._write(f"- {e}\n")
+        self._write(f"\nCompleted: {datetime.now(timezone.utc).isoformat()}\n")
+
+    def _write(self, text: str) -> None:
+        try:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+
+
+class ClawTurnLoop:
+    """Agentic turn loop: LLM iteratively calls tools to generate code.
+
+    Ported from claw-code's ``ConversationRuntime``:
+    - Max 16 iterations (same as claw-code)
+    - Tool results fed back as ``tool`` role messages
+    - Stops when LLM responds without tool calls
+    """
+
+    def __init__(
+        self,
+        *,
+        llm_config: Any,
+        workspace: Path,
+        system_prompt: str,
+        session: CodegenSession,
+        allowed_read_dirs: list[Path] | None = None,
+        bash_timeout: int = 60,
+        max_iterations: int = MAX_ITERATIONS,
+        python_path: str = "",
+    ) -> None:
+        self._llm_config = llm_config
+        self._workspace = workspace
+        self._system_prompt = system_prompt
+        self._session = session
+        self._max_iterations = max_iterations
+        self._messages: list[dict[str, Any]] = []
+
+        self._executor = ToolExecutor(
+            workspace=workspace,
+            allowed_read_dirs=allowed_read_dirs,
+            bash_timeout=bash_timeout,
+            python_path=python_path,
+        )
+        self._permissions = SandboxPermissionPolicy(
+            workspace=workspace,
+            allowed_read_dirs=allowed_read_dirs,
+        )
+
+        self._api_tools = self._build_api_tools()
+        _coding = getattr(llm_config, "coding_model", "") or ""
+        self._use_text_tools = (
+            self._is_claude_model(llm_config.primary_model)
+            or (bool(_coding) and self._is_claude_model(_coding))
+        )
+        if self._use_text_tools:
+            self._text_tool_prompt = self._build_text_tool_prompt()
+            logger.info(
+                "[codegen] Claude model detected (primary=%s, coding=%s) "
+                "— using text-based tool calling",
+                llm_config.primary_model, _coding,
+            )
+        self._simulation_check_done = False
+        self._plan_check_done = False
+        self._exp_plan = ""
+
+        # Step-by-step trace log for debugging
+        trace_dir = workspace.parent if workspace.parent.is_dir() else workspace
+        self._trace = _TraceLog(trace_dir)
+
+    def set_exp_plan(self, plan: str) -> None:
+        """Set the experiment plan for plan compliance checking."""
+        self._exp_plan = plan
+
+    def run_turn(self, user_message: str) -> TurnResult:
+        """Execute the full turn loop with detailed step-by-step tracing."""
+        t0 = time.monotonic()
+        self._session.log(CodegenPhase.GENERATE, "Turn loop started")
+        self._messages.append({"role": "user", "content": user_message})
+
+        result = TurnResult()
+
+        for iteration in range(self._max_iterations):
+            iter_num = iteration + 1
+            self._trace.iteration_start(iter_num, self._max_iterations)
+            self._session.log(
+                CodegenPhase.GENERATE,
+                f"Turn {iter_num}/{self._max_iterations}: calling LLM...",
+            )
+
+            # ── LLM call ──
+            self._trace.llm_request(
+                n_messages=len(self._messages),
+                n_tools=len(self._api_tools),
+                model=self._llm_config.primary_model,
+            )
+
+            response = None
+            _max_retries = 5
+            for _retry in range(_max_retries):
+                try:
+                    response = self._call_llm()
+                    # Guard against proxy returning valid JSON but empty content
+                    _usage = (response or {}).get("usage", {})
+                    _comp = _usage.get("completion_tokens", -1)
+                    if _comp == 0:
+                        self._session.log(
+                            CodegenPhase.GENERATE,
+                            f"LLM attempt {_retry + 1}/{_max_retries}: "
+                            "empty completion (0 tokens) — retrying",
+                        )
+                        response = None
+                        time.sleep(2 ** min(_retry, 3))
+                        continue
+                    break
+                except Exception as exc:
+                    self._session.log(
+                        CodegenPhase.GENERATE,
+                        f"LLM call attempt {_retry + 1}/{_max_retries} failed: {exc}",
+                    )
+                    if _retry < _max_retries - 1:
+                        time.sleep(2 ** min(_retry, 3))
+                    else:
+                        error_msg = f"LLM call failed after {_max_retries} retries at iteration {iter_num}: {exc}"
+                        self._session.log_error(CodegenPhase.GENERATE, error_msg, exc)
+                        result.errors.append(error_msg)
+            if response is None:
+                break
+
+            result.iterations = iter_num
+
+            # ── Parse response ──
+            assistant_text, tool_uses = self._parse_response(response)
+            usage = response.get("usage")
+            self._trace.llm_response(assistant_text, tool_uses, usage)
+
+            if assistant_text:
+                result.final_text = assistant_text
+                self._session.log(
+                    CodegenPhase.GENERATE,
+                    f"Turn {iter_num}: LLM text ({len(assistant_text)} chars)",
+                )
+
+            if self._use_text_tools:
+                self._messages.append({"role": "assistant", "content": assistant_text})
+            else:
+                self._messages.append(self._build_assistant_message(response))
+
+            if not tool_uses:
+                self._session.log(
+                    CodegenPhase.GENERATE,
+                    f"Turn {iter_num}: no tool calls — loop complete",
+                )
+                break
+
+            self._session.log(
+                CodegenPhase.GENERATE,
+                f"Turn {iter_num}: {len(tool_uses)} tool call(s): "
+                f"{[tu['function']['name'] for tu in tool_uses]}",
+            )
+
+            # ── Execute each tool call ──
+            for tu in tool_uses:
+                tool_name = tu["function"]["name"]
+                tool_id = tu.get("id", f"call_{result.tool_calls}")
+                try:
+                    tool_input = json.loads(tu["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError):
+                    tool_input = {}
+
+                result.tool_calls += 1
+                self._session.llm_calls += 1
+
+                perm_error = self._permissions.check(tool_name, tool_input)
+                if perm_error:
+                    self._session.log(
+                        CodegenPhase.GENERATE,
+                        f"  DENIED {tool_name}: {perm_error}",
+                    )
+                    self._trace.permission_denied(tool_name, perm_error)
+                    if self._use_text_tools:
+                        self._messages.append({
+                            "role": "user",
+                            "content": self._format_text_tool_feedback(
+                                tool_name,
+                                tool_input,
+                                f"PERMISSION DENIED: {perm_error}",
+                            ),
+                        })
+                    else:
+                        self._messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": f"PERMISSION DENIED: {perm_error}",
+                        })
+                    continue
+
+                self._session.log(
+                    CodegenPhase.GENERATE,
+                    f"  Executing {tool_name}({self._summarize_input(tool_name, tool_input)})",
+                )
+                tool_t0 = time.monotonic()
+                tool_result, is_error = self._executor.execute(tool_name, tool_input)
+                tool_elapsed_ms = int((time.monotonic() - tool_t0) * 1000)
+
+                # Write to trace log
+                self._trace.tool_call(
+                    tool_name, tool_input, tool_result, is_error, tool_elapsed_ms,
+                )
+
+                if is_error:
+                    self._session.log(
+                        CodegenPhase.GENERATE,
+                        f"  {tool_name} ERROR ({tool_elapsed_ms}ms): {tool_result[:200]}",
+                    )
+                else:
+                    self._session.log(
+                        CodegenPhase.GENERATE,
+                        f"  {tool_name} OK ({tool_elapsed_ms}ms, {len(tool_result)} chars)",
+                    )
+
+                if self._use_text_tools:
+                    self._messages.append({
+                        "role": "user",
+                        "content": self._format_text_tool_feedback(
+                            tool_name, tool_input, tool_result,
+                        ),
+                    })
+                else:
+                    self._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": tool_result,
+                    })
+
+            # Log workspace state after each iteration
+            ws_files = self._list_workspace_files()
+            self._trace.iteration_end(ws_files)
+
+            # ── Anti-simulation gate ──
+            # After the agent writes main.py and runs it successfully,
+            # auto-inject a verification message forcing the self-check.
+            if (
+                "main.py" in ws_files
+                and not self._simulation_check_done
+                and any(
+                    tu["function"]["name"] == "bash"
+                    and "python" in tu["function"].get("arguments", "")
+                    for tu in tool_uses
+                )
+            ):
+                check_result = self._run_simulation_check()
+                if check_result:
+                    self._simulation_check_done = True
+                    self._session.log(
+                        CodegenPhase.VALIDATE,
+                        f"Anti-simulation gate: {check_result[:200]}",
+                    )
+                    if self._plan_requires_pretrained_model():
+                        correction = (
+                            "Use the real pretrained model required by the plan via its validated loading API."
+                        )
+                    else:
+                        correction = (
+                            "Use the exact classical estimators required by the plan on real data; "
+                            "do not introduce a pretrained neural model."
+                        )
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            "ANTI-SIMULATION VERIFICATION FAILED. Your code uses "
+                            "forbidden simulation patterns. Here are the results:\n\n"
+                            f"{check_result}\n\n"
+                            f"{correction} "
+                            "The experiment plan specifies specific methods — implement them "
+                            "using the actual ML libraries and local checkpoints. "
+                            "Do NOT use brightness/contrast/augmentation as experimental conditions."
+                        ),
+                    })
+
+            # ── Plan compliance gate ──
+            # Like claw-code's CLAUDE.md instructions that persist across turns,
+            # we check the code against the experiment plan's key requirements
+            # and inject corrective messages when violations are found.
+            if (
+                "main.py" in ws_files
+                and not self._plan_check_done
+                and self._exp_plan
+                and any(
+                    tu["function"]["name"] == "bash"
+                    and "python" in tu["function"].get("arguments", "")
+                    for tu in tool_uses
+                )
+            ):
+                plan_violations = self._run_plan_compliance_check()
+                if plan_violations:
+                    self._plan_check_done = True
+                    self._session.log(
+                        CodegenPhase.VALIDATE,
+                        f"Plan compliance gate: {len(plan_violations)} violation(s)",
+                    )
+                    violation_text = "\n".join(f"- {v}" for v in plan_violations)
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            "PLAN COMPLIANCE CHECK FAILED. Your code does NOT follow "
+                            "the experiment plan. Violations found:\n\n"
+                            f"{violation_text}\n\n"
+                            "You MUST fix these violations. Re-read the EXPERIMENT_PLAN.yaml "
+                            "and implement what it specifies. Do NOT take shortcuts — "
+                            "if the plan says to load reference frames from a directory, "
+                            "load them; if it defines 4 conditions, implement all 4 with "
+                            "genuinely different logic."
+                        ),
+                    })
+
+        else:
+            self._session.log(
+                CodegenPhase.GENERATE,
+                f"Turn loop hit max iterations ({self._max_iterations})",
+            )
+
+        result.files = self._collect_workspace_files()
+        result.elapsed_sec = time.monotonic() - t0
+
+        self._trace.loop_end(result)
+
+        self._session.log(
+            CodegenPhase.GENERATE,
+            f"Turn loop done: {result.iterations} iterations, "
+            f"{result.tool_calls} tool calls, "
+            f"{len(result.files)} files, {result.elapsed_sec:.1f}s",
+        )
+
+        self._save_conversation_log()
+        return result
+
+    # ------------------------------------------------------------------
+    # LLM API call with tool support
+    # ------------------------------------------------------------------
+
+    def _call_llm(self) -> dict[str, Any]:
+        """Call the LLM API with tool definitions (OpenAI-compatible)."""
+        cfg = self._llm_config
+        base_url = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
+        url = f"{base_url}/chat/completions"
+
+        system_prompt = self._system_prompt
+        if self._use_text_tools:
+            system_prompt += self._text_tool_prompt
+
+        model = cfg.primary_model
+        if self._use_text_tools:
+            _coding = getattr(cfg, "coding_model", "") or ""
+            if _coding and self._is_claude_model(_coding):
+                model = _coding
+
+        _RESPONSES_API = ("gpt-5.", "gpt-5")
+        _is_responses_model = (
+            any(model.startswith(p) for p in _RESPONSES_API)
+            and not model.startswith("gpt-5.4")
+        )
+        _tok_key = "max_output_tokens" if _is_responses_model else "max_tokens"
+        _tok_val = 8192
+
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                *self._messages,
+            ],
+            _tok_key: _tok_val,
+        }
+
+        if not self._use_text_tools:
+            body["tools"] = self._api_tools
+            body["tool_choice"] = "auto"
+
+        if any(model.startswith(p) for p in ("o3", "o4", "gpt-5")):
+            body[_tok_key] = 16384
+
+        payload = json.dumps(body).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.api_key}",
+        }
+
+        req = urllib.request.Request(url, data=payload, headers=headers)
+        timeout = getattr(cfg, "timeout_sec", 600)
+
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        return data
+
+    def _parse_response(
+        self, data: dict[str, Any]
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Extract text content and tool_use calls from API response.
+
+        Falls back to parsing JSON tool calls from text content when the
+        structured ``tool_calls`` field is absent — some models/proxies
+        return tool invocations as plain-text JSON in ``content``.
+        """
+        choices = data.get("choices", [])
+        if not choices:
+            return "", []
+
+        message = choices[0].get("message", {})
+        text = message.get("content") or ""
+        tool_calls = message.get("tool_calls", [])
+
+        if not tool_calls and text.strip():
+            recovered = self._try_recover_tool_calls_from_text(text)
+            if recovered:
+                logger.info(
+                    "[turn_loop] Recovered %d tool call(s) from text content",
+                    len(recovered),
+                )
+                tool_calls = recovered
+                if not self._use_text_tools:
+                    message["tool_calls"] = recovered
+
+        return text, tool_calls
+
+    def _try_recover_tool_calls_from_text(
+        self, text: str,
+    ) -> list[dict[str, Any]]:
+        """Try to parse tool call JSON embedded in assistant text.
+
+        Handles formats like:
+          {"tool": "read_file", "parameters": {"path": "..."}}
+          [{"tool": "write_file", "parameters": {...}}, ...]
+        """
+        import re
+        import uuid
+
+        valid_tool_names = {spec["name"] for spec in TOOL_SPECS}
+
+        candidates: list[dict[str, Any]] = []
+        stripped = text.strip()
+
+        blobs: list[Any] = []
+        try:
+            parsed = json.loads(stripped)
+            blobs = parsed if isinstance(parsed, list) else [parsed]
+        except (json.JSONDecodeError, ValueError):
+            for m in re.finditer(r'\{[^{}]*"tool"\s*:\s*"[^"]+?"[^{}]*\}', stripped):
+                try:
+                    blobs.append(json.loads(m.group()))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        for blob in blobs:
+            if not isinstance(blob, dict):
+                continue
+            tool_name = blob.get("tool") or blob.get("name") or blob.get("function", {}).get("name")
+            if not tool_name or tool_name not in valid_tool_names:
+                continue
+            params = blob.get("parameters") or blob.get("arguments") or blob.get("input") or {}
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except (json.JSONDecodeError, ValueError):
+                    params = {}
+
+            if isinstance(params, dict):
+                params = self._normalize_tool_params(tool_name, params)
+
+            candidates.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(params),
+                },
+            })
+
+        return candidates
+
+    @staticmethod
+    def _normalize_tool_params(tool_name: str, params: dict) -> dict:
+        """Map common parameter name aliases to canonical names."""
+        _ALIASES: dict[str, dict[str, str]] = {
+            "read_file": {"filename": "path", "file": "path", "file_path": "path", "filepath": "path"},
+            "write_file": {"filename": "path", "file": "path", "file_path": "path",
+                           "contents": "content", "text": "content", "data": "content"},
+            "edit_file": {"filename": "path", "file": "path", "file_path": "path",
+                          "find": "old_string", "search": "old_string",
+                          "replace": "new_string", "replacement": "new_string"},
+            "glob_search": {"glob": "pattern", "glob_pattern": "pattern",
+                            "directory": "path", "dir": "path"},
+            "grep_search": {"regex": "pattern", "query": "pattern",
+                            "directory": "path", "dir": "path"},
+            "bash": {"cmd": "command", "script": "command", "shell": "command"},
+        }
+        aliases = _ALIASES.get(tool_name, {})
+        if not aliases:
+            return params
+        normalized = {}
+        for k, v in params.items():
+            canonical = aliases.get(k, k)
+            normalized[canonical] = v
+        return normalized
+
+    @staticmethod
+    def _build_assistant_message(data: dict[str, Any]) -> dict[str, Any]:
+        """Build the assistant message to append to conversation history."""
+        choices = data.get("choices", [])
+        if choices:
+            return choices[0].get("message", {"role": "assistant", "content": ""})
+        return {"role": "assistant", "content": ""}
+
+    def _build_api_tools(self) -> list[dict[str, Any]]:
+        """Convert tool specs to OpenAI-compatible tool definitions."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": spec["name"],
+                    "description": spec["description"],
+                    "parameters": spec["input_schema"],
+                },
+            }
+            for spec in TOOL_SPECS
+        ]
+
+    @staticmethod
+    def _is_claude_model(model_name: str) -> bool:
+        return "claude" in model_name.lower()
+
+    def _build_text_tool_prompt(self) -> str:
+        """Build tool descriptions for system prompt (text-based mode).
+
+        Used when the proxy doesn't reliably translate structured
+        tool calls (e.g. Claude via OpenAI-compatible proxy).
+        """
+        lines = [
+            "\n\n---\n## Tool Calling\n",
+            "To use a tool, output EXACTLY one JSON object per message:",
+            '{"tool": "<tool_name>", "parameters": {<params>}}',
+            "",
+            "IMPORTANT: Output ONLY the JSON object. No extra text.",
+            "After receiving the tool result, decide the next action.",
+            "",
+            "Available tools:",
+        ]
+        for spec in TOOL_SPECS:
+            name = spec["name"]
+            desc = spec["description"]
+            schema = spec["input_schema"]
+            props = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            lines.append(f"\n### {name}")
+            lines.append(desc)
+            lines.append("Parameters:")
+            for pname, pinfo in props.items():
+                req = " **(required)**" if pname in required else ""
+                pdesc = pinfo.get("description", "")
+                ptype = pinfo.get("type", "string")
+                lines.append(f"  - `{pname}` ({ptype}): {pdesc}{req}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_text_tool_feedback(
+        tool_name: str, tool_input: dict[str, Any], tool_result: str,
+    ) -> str:
+        """Return a text-only tool transcript for Claude-style loops."""
+        return (
+            f"Tool result ({tool_name})\n"
+            f"Arguments: {json.dumps(tool_input, ensure_ascii=False, sort_keys=True)}\n"
+            f"Result:\n{tool_result}"
+        )
+
+    # ------------------------------------------------------------------
+    # Workspace file collection
+    # ------------------------------------------------------------------
+
+    _COLLECT_EXTENSIONS = frozenset({
+        ".py", ".yaml", ".yml", ".json", ".txt", ".csv", ".tsv", ".cfg", ".ini", ".toml",
+    })
+    _SKIP_DIRS = frozenset({
+        "__pycache__", "codebases", "datasets", "checkpoints", ".git",
+    })
+
+    def _collect_workspace_files(self) -> GeneratedFiles:
+        """Collect code and config files from workspace."""
+        files: GeneratedFiles = {}
+        for fpath in sorted(self._workspace.rglob("*")):
+            if not fpath.is_file() or fpath.is_symlink():
+                continue
+            rel = fpath.relative_to(self._workspace)
+            if any(p.startswith(".") or p in self._SKIP_DIRS for p in rel.parts):
+                continue
+            if fpath.suffix.lower() not in self._COLLECT_EXTENSIONS:
+                continue
+            if fpath.stat().st_size > 2 * 1024 * 1024:
+                continue
+            try:
+                files[str(rel)] = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        return files
+
+    def _list_workspace_files(self) -> list[str]:
+        """Quick list of workspace files (for trace logging)."""
+        result = []
+        for f in sorted(self._workspace.rglob("*")):
+            if f.is_file() and not f.is_symlink():
+                rel = f.relative_to(self._workspace)
+                if not any(p.startswith(".") or p == "__pycache__" for p in rel.parts):
+                    result.append(str(rel))
+        return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _plan_requires_pretrained_model(self) -> bool:
+        """Return False for explicit classical-ML-only executable plans."""
+        try:
+            plan_data = yaml.safe_load(self._exp_plan or "") or {}
+        except Exception:  # noqa: BLE001
+            plan_data = {}
+        if not isinstance(plan_data, dict):
+            return True
+        proposed = plan_data.get("proposed_methods", [])
+        baselines = plan_data.get("baselines", [])
+        executable = json.dumps(
+            {"proposed_methods": proposed, "baselines": baselines},
+            ensure_ascii=False,
+        ).lower()
+        pretrained_tokens = (
+            "pretrained", "from_pretrained", "checkpoint", "diffusion", "transformer",
+            "resnet", "vit", "clip", "llm", "cnn", "lstm",
+        )
+        if any(token in executable for token in pretrained_tokens):
+            return True
+        classical_tokens = (
+            "sklearn", "sgdclassifier", "randomforestclassifier", "linear sgd",
+            "random forest", "随机森林",
+        )
+        return not (not proposed and any(token in executable for token in classical_tokens))
+
+    def _run_simulation_check(self) -> str | None:
+        """Run anti-simulation checks on main.py.
+
+        Returns a failure message if simulation is detected, None if clean.
+        """
+        main_py = self._workspace / "main.py"
+        if not main_py.exists():
+            return None
+
+        code = main_py.read_text(encoding="utf-8")
+        lines = code.splitlines()
+        violations: list[str] = []
+
+        # Check 1: nn.Linear used as primary model (not LoRA adapter)
+        for i, line in enumerate(lines, 1):
+            if "nn.Linear" in line:
+                line_lower = line.lower()
+                if not any(kw in line_lower for kw in (
+                    "lora", "adapter", "projection", "head", "classifier",
+                    "fc", "linear_probe", "to_out", "to_q", "to_k", "to_v",
+                )):
+                    violations.append(f"FORBIDDEN nn.Linear as model → Line {i}: {line.strip()}")
+
+        # Check 2: Mock functions
+        for i, line in enumerate(lines, 1):
+            if any(pat in line for pat in ("_mock", "mock_", "random.uniform")):
+                violations.append(f"FORBIDDEN mock/random metric → Line {i}: {line.strip()}")
+
+        # Check 3: try/except returning hardcoded metrics
+        # Pattern: except ... return {"fid": 0.8, ...}
+        in_except = False
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith("except"):
+                in_except = True
+            elif in_except and stripped.startswith("return"):
+                # Check if the return contains hardcoded numbers
+                import re
+                hardcoded = re.findall(r'"(?:fid|clip|metric|score|loss)":\s*[\d.]+', stripped)
+                if hardcoded:
+                    violations.append(
+                        f"FORBIDDEN hardcoded fallback metric in except block → "
+                        f"Line {i}: {stripped[:100]}"
+                    )
+                in_except = False
+            elif in_except and not stripped.startswith(("print", "#", "")):
+                if not stripped.startswith(" ") and stripped:
+                    in_except = False
+
+        # Check 4: bare except that silently swallows errors
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped in ("except:", "except Exception:", "except Exception as e:"):
+                # Look ahead for return with numbers or pass
+                for j in range(i, min(i + 5, len(lines))):
+                    next_line = lines[j].strip()
+                    if next_line == "pass":
+                        violations.append(
+                            f"FORBIDDEN silent except/pass → Line {i}: {stripped}"
+                        )
+                        break
+                    if next_line.startswith("return") and any(
+                        c.isdigit() for c in next_line
+                    ):
+                        violations.append(
+                            f"FORBIDDEN except returning hardcoded value → "
+                            f"Line {i}-{j+1}: {stripped} ... {next_line[:80]}"
+                        )
+                        break
+
+        # Check 5: Require the implementation API appropriate to the plan.
+        if self._plan_requires_pretrained_model():
+            has_real_model = any(pat in code for pat in (
+                "from_pretrained", "load_state_dict", "create_model",
+                "timm.", "torchvision.models",
+            ))
+            if not has_real_model:
+                violations.append(
+                    "MISSING: No real model loading found (from_pretrained, "
+                    "load_state_dict, create_model, torchvision.models)"
+                )
+        else:
+            required_estimators = []
+            plan_lower = self._exp_plan.lower()
+            if "sgdclassifier" in plan_lower or "linear sgd" in plan_lower:
+                required_estimators.append("SGDClassifier")
+            if "randomforestclassifier" in plan_lower or "random forest" in plan_lower or "随机森林" in plan_lower:
+                required_estimators.append("RandomForestClassifier")
+            for estimator in required_estimators:
+                if estimator not in code:
+                    violations.append(f"MISSING: Requested estimator {estimator} is not implemented")
+            if ".fit(" not in code or ".predict(" not in code:
+                violations.append("MISSING: Classical estimators are not both fitted and evaluated")
+
+        # Check 6: Image augmentation as "experimental condition"
+        augment_patterns = ["brightness", "contrast", "augment_image", "enhance("]
+        for i, line in enumerate(lines, 1):
+            line_lower = line.lower()
+            if any(pat in line_lower for pat in augment_patterns):
+                if "condition" in line_lower or "def condition_" in line_lower:
+                    violations.append(
+                        f"FORBIDDEN augmentation as condition → Line {i}: {line.strip()}"
+                    )
+
+        if not violations:
+            return None
+
+        return (
+            "ANTI-SIMULATION CHECK FAILED — " + str(len(violations)) + " violation(s):\n\n"
+            + "\n".join(f"  {v}" for v in violations)
+            + "\n\nYou MUST fix ALL violations:\n"
+            "- Remove ALL try/except blocks around model code. Let errors crash.\n"
+            "- Remove ALL hardcoded fallback return values.\n"
+            "- Use the correct model loading approach based on what you discovered in the workspace.\n"
+            "- Each condition must have genuinely different code, not copy-paste with minor changes."
+        )
+
+    def _run_plan_compliance_check(self) -> list[str]:
+        """Check code against experiment plan requirements.
+
+        Inspired by claw-code's CLAUDE.md instruction files which persist
+        across all turns and enforce project-specific rules. We extract
+        verifiable constraints from the experiment plan and check the code.
+        """
+        main_py = self._workspace / "main.py"
+        if not main_py.exists() or not self._exp_plan:
+            return []
+
+        code = main_py.read_text(encoding="utf-8")
+        plan = self._exp_plan.lower()
+        violations: list[str] = []
+
+        # 1. Check all methods/conditions from plan are implemented
+        import re
+        try:
+            plan_data = yaml.safe_load(self._exp_plan) or {}
+        except Exception:
+            plan_data = {}
+
+        def _iter_named_entries(section_name: str) -> list[tuple[str, dict[str, Any]]]:
+            section = plan_data.get(section_name, {}) if isinstance(plan_data, dict) else {}
+            entries: list[tuple[str, dict[str, Any]]] = []
+            if isinstance(section, dict):
+                for name, item in section.items():
+                    if isinstance(item, dict):
+                        entries.append((str(name), item))
+            elif isinstance(section, list):
+                for item in section:
+                    if isinstance(item, dict):
+                        name = item.get("name")
+                        if isinstance(name, str) and name.strip():
+                            entries.append((name.strip(), item))
+            return entries
+
+        def _is_meaningful_runtime_param(param_name: str, value: Any) -> bool:
+            if param_name.startswith("lambda_") or param_name == "margin":
+                return isinstance(value, (int, float)) and float(value) > 0
+            if param_name in ("hidden_layer_indices", "selectively_unfrozen_blocks", "target_modules"):
+                return isinstance(value, (list, tuple)) and len(value) > 0
+            if param_name == "multi_concept_mode":
+                return isinstance(value, str) and value not in ("", "single", "none")
+            return False
+
+        def _param_usage_patterns(param_name: str) -> tuple[str, ...]:
+            patterns = {
+                "hidden_layer_indices": (r"\.hidden_layer_indices\b", r"hidden_layer_indices", r"layer_indices"),
+                "selectively_unfrozen_blocks": (r"selectively_unfrozen_blocks", r"select_unfrozen", r"unfrozen_blocks"),
+                "multi_concept_mode": (r"\.multi_concept_mode\b", r"multi_concept_mode", r"sample_related_pairs", r"sample_unrelated_pairs"),
+                "target_modules": (r"\.target_modules\b", r"target_modules"),
+            }
+            if param_name in patterns:
+                return patterns[param_name]
+            return (rf"\.{re.escape(param_name)}\b",)
+
+        def _symbol_is_defined(name: str) -> bool:
+            return bool(re.search(rf"\bdef\s+{re.escape(name)}\s*\(", code))
+
+        def _symbol_is_called(name: str) -> bool:
+            return bool(re.search(rf"(?<!def\s)\b{re.escape(name)}\s*\(", code))
+
+        def _loss_term_patterns(term_name: str) -> tuple[str, ...]:
+            normalized = term_name.strip().lower()
+            patterns = {
+                "diffusion_loss": (r"\bdiffusion_loss\b", r"\bdiff_loss\b", r"mse_loss", r"noise_loss"),
+                "sameconcept_pull_loss": (r"lambda_sameconcept", r"sameconcept", r"same_concept", r"\bl_same\b"),
+                "diffconcept_margin_loss": (r"lambda_diffconcept", r"diffconcept", r"diff_concept", r"\bl_diff\b", r"\bmargin\b"),
+                "intervention_consistency_loss": (r"lambda_consistency", r"intervention", r"consistency"),
+                "separation_margin_loss": (r"lambda_sep", r"separation", r"mismatch", r"\bmargin\b"),
+                "prior_preservation_loss": (r"lambda_prior", r"prior_preservation", r"\bprior\b"),
+                "internal_state_regularization": (r"lambda_internal", r"hidden_state", r"hidden_layer", r"internal"),
+                "balance_loss": (r"lambda_balance", r"\bbalance\b"),
+                "l2_regularization": (r"penalty\s*=\s*['\"]l2['\"]", r"\bl2\b"),
+                "gini_impurity": (r"randomforestclassifier", r"criterion\s*=\s*['\"]gini['\"]"),
+            }
+            if normalized in patterns:
+                return patterns[normalized]
+            return (re.escape(normalized),)
+
+        def _data_pairing_patterns(pairing_name: str) -> tuple[str, ...]:
+            normalized = pairing_name.strip().lower()
+            patterns = {
+                "prompt_swaps": (r"construct_prompt_swaps", r"prompt_swap", r"swapped", r"swap"),
+                "intervention_pairs": (r"build_intervention_pairs", r"intervention_pairs", r"paired_prompts", r"matched", r"mismatch"),
+                "related_concept_pairs": (r"sample_related_pairs", r"related_pairs", r"multi_concept_mode"),
+                "unrelated_concept_pairs": (r"sample_unrelated_pairs", r"unrelated_pairs", r"multi_concept_mode"),
+                "filesystem_reference_pairs": (r"pair_dataset", r"gt_path", r"reference", r"paired"),
+                "none": tuple(),
+            }
+            if normalized in patterns:
+                return patterns[normalized]
+            return (re.escape(normalized),)
+
+        def _model_edit_patterns(edit_name: str) -> tuple[str, ...]:
+            normalized = edit_name.strip().lower()
+            patterns = {
+                "monkey_patch_forward": (r"monkey_patch", r"\.forward\s*=", r"setattr", r"patched_forward"),
+                "replace_module": (r"replace_module", r"setattr", r"nn\.", r"module_dict", r"register_module"),
+                "selective_unfreezing": (r"requires_grad\s*=\s*true", r"select_unfrozen", r"unfrozen_blocks", r"selectively_unfrozen_blocks"),
+                "attach_lora": (r"get_peft_model", r"loraconfig", r"add_adapter", r"attach_lora"),
+                "register_forward_hook": (r"register_forward_hook", r"forward_hook"),
+                "register_pre_hook": (r"register_forward_pre_hook", r"forward_pre_hook"),
+                "register_hidden_state_hook": (r"register_forward_hook", r"hidden_state", r"hook"),
+                "replace_attention_block": (r"attention", r"setattr", r"replace_", r"patched"),
+                "replace_norm_block": (r"norm", r"setattr", r"replace_", r"patched"),
+                "none": tuple(),
+            }
+            if normalized in patterns:
+                return patterns[normalized]
+            return (re.escape(normalized),)
+
+        def _runtime_hook_patterns(hook_name: str) -> tuple[str, ...]:
+            normalized = hook_name.strip().lower()
+            patterns = {
+                "hidden_state_hook": (r"register_forward_hook", r"hidden_state", r"hook"),
+                "forward_hook": (r"register_forward_hook", r"forward_hook"),
+                "pre_forward_hook": (r"register_forward_pre_hook", r"forward_pre_hook"),
+                "scheduler_hook": (r"scheduler", r"hook", r"setattr"),
+                "transformer_block_hook": (r"transformer", r"hook", r"register_forward_hook"),
+                "none": tuple(),
+            }
+            if normalized in patterns:
+                return patterns[normalized]
+            return (re.escape(normalized),)
+
+        # Extract only executable methods.  Scanning every indented YAML key
+        # misclassified metrics, risks, and implementation metadata as methods.
+        plan_methods: list[tuple[str, dict[str, Any]]] = []
+        for section_name in ("methods", "proposed_methods", "baselines"):
+            plan_methods.extend(_iter_named_entries(section_name))
+
+        # Check each executable method has a corresponding class/API/name in code.
+        compact_code = re.sub(r"[^a-z0-9]", "", code.lower())
+        for method, item in plan_methods:
+            spec = item.get("implementation_spec", {}) if isinstance(item, dict) else {}
+            candidates = [method]
+            if isinstance(spec, dict):
+                candidates.extend(str(spec.get(key, "")) for key in ("class_name", "estimator"))
+            found = any(
+                re.sub(r"[^a-z0-9]", "", candidate.lower()) in compact_code
+                for candidate in candidates
+                if candidate.strip()
+            )
+            if not found:
+                violations.append(
+                    f"MISSING CONDITION: Plan defines '{method}' but no matching "
+                    f"class or estimator found in code. You must implement ALL executable conditions."
+                )
+
+        # 2. Check reference frames: if plan mentions first_frames, code must load them
+        if "first_frames" in plan and "first_frames" in code.lower():
+            if "torch.randint" in code and "fid" in code.lower():
+                violations.append(
+                    "FAKE REFERENCE FRAMES: Code uses torch.randint() as FID reference "
+                    "frames instead of loading real images from first_frames directory. "
+                    "You MUST load actual PNG files: Image.open(path).convert('RGB')"
+                )
+
+        # 2b. Check for hardcoded metric return values (e.g. "clip_score": 0.0)
+        for i, line in enumerate(code.splitlines(), 1):
+            stripped = line.strip()
+            if "return" in stripped:
+                import re as _re
+                hardcoded = _re.findall(
+                    r'"(?:clip_score|fid|metric|score|loss|accuracy)":\s*0\.0',
+                    stripped,
+                )
+                if hardcoded:
+                    violations.append(
+                        f"HARDCODED METRIC: Line {i} returns hardcoded 0.0 for {hardcoded[0].split(':')[0]}. "
+                        f"Every metric must be computed from real model output, not hardcoded."
+                    )
+
+        # 2c. Optional metrics may be skipped, but should not silently become NaN.
+        for i, line in enumerate(code.splitlines(), 1):
+            stripped = line.strip().lower()
+            if any(pat in stripped for pat in ('"clip_score": math.nan', "'clip_score': math.nan", '"clip_score": float("nan")', "'clip_score': float(\"nan\")")):
+                violations.append(
+                    f"UNCLEAR METRIC STATUS: Line {i} returns NaN for clip_score. "
+                    "If CLIP score is unavailable offline, return an explicit skipped reason/status instead of NaN."
+                )
+
+        # 2d. Check for fake attribute assignments (only if plan mentions adaptive LoRA)
+        if any(kw in plan for kw in ("adaptive", "rank_pattern", "per-layer", "per_layer")):
+            for i, line in enumerate(code.splitlines(), 1):
+                stripped = line.strip()
+                if "module.r =" in stripped or "module.lora_alpha =" in stripped:
+                    violations.append(
+                        f"FAKE ADAPTIVE LORA: Line {i}: '{stripped}' — setting module.r/module.lora_alpha "
+                        f"does NOT change the LoRA matrix dimensions. To get different ranks per layer, "
+                        f"you must apply separate LoraConfig objects to different layer groups with "
+                        f"different adapter_name parameters."
+                    )
+
+        # 2e. Video experiments should not silently collapse to a single frame in evaluation.
+        if any(kw in plan for kw in ("video", "num_frames", "t2v", "i2v")):
+            for i, line in enumerate(code.splitlines(), 1):
+                stripped = line.strip().replace(" ", "")
+                if "frames[0][0]" in stripped or ".frames[0][0]" in stripped:
+                    violations.append(
+                        f"SINGLE-FRAME VIDEO EVAL: Line {i} only uses the first generated frame. "
+                        f"Video evaluation should iterate over `output.frames[0]` unless the plan explicitly says first-frame-only."
+                    )
+                    break
+
+        # 2f. Detect heuristic "human labels" or ratings derived from prompts / filenames.
+        suspicious_targets = (
+            "human_rating", "human_score", "semantic_rating", "rating",
+            "label", "ground_truth", "gt_label", "target_label",
+        )
+        suspicious_sources = (
+            "prompt", "filename", "file_name", "path", "stem", "clip_id",
+        )
+        for i, line in enumerate(code.splitlines(), 1):
+            lowered = line.strip().lower()
+            if "=" not in lowered:
+                continue
+            if any(target in lowered for target in suspicious_targets) and any(source in lowered for source in suspicious_sources):
+                violations.append(
+                    f"HEURISTIC LABEL SOURCE: Line {i} appears to derive ratings/labels from prompt or filename metadata. "
+                    "Human labels / ground truth must come from real annotations or an explicitly plan-defined supervision source, "
+                    "not from prompts, paths, clip IDs, or file names."
+                )
+                break
+
+        # 2g. Detect outputs that claim methods were implemented without being executed.
+        planned_method_names = {name for name, _ in plan_methods}
+        if planned_method_names:
+            executed_methods: set[str] = set()
+            for method_name in planned_method_names:
+                if f'condition == "{method_name}"' in code or f"condition == '{method_name}'" in code:
+                    executed_methods.add(method_name)
+                elif method_name in code and "conditions = [" in code:
+                    list_pos = code.find("conditions = [")
+                    if list_pos != -1:
+                        list_end = code.find("]", list_pos)
+                        if list_end != -1 and method_name in code[list_pos:list_end]:
+                            executed_methods.add(method_name)
+                else:
+                    item = next((entry for name, entry in plan_methods if name == method_name), {})
+                    spec = item.get("implementation_spec", {}) if isinstance(item, dict) else {}
+                    class_name = str(spec.get("class_name", "")) if isinstance(spec, dict) else ""
+                    if class_name and class_name in code and ".fit(" in code and ".predict(" in code:
+                        executed_methods.add(method_name)
+            metadata_only = sorted(
+                method_name
+                for method_name in planned_method_names
+                if method_name in code and method_name not in executed_methods
+            )
+            if metadata_only:
+                violations.append(
+                    "METADATA-ONLY METHODS: The code references planned methods in summaries/strings but does not execute them: "
+                    + ", ".join(metadata_only[:6])
+                    + (", ..." if len(metadata_only) > 6 else "")
+                    + ". Do not claim method coverage in outputs unless those methods are actually implemented and run."
+                )
+
+        # 2h. Distinctive key_methods from implementation_spec should appear in code.
+        impl_specs: dict[str, dict[str, Any]] = {}
+        for section_name in ("proposed_methods", "baselines"):
+            for method_name, item in _iter_named_entries(section_name):
+                spec = item.get("implementation_spec") if isinstance(item, dict) else None
+                if isinstance(spec, dict):
+                    impl_specs[method_name] = spec
+
+        generic_key_methods = {
+            "__init__", "forward", "train_step", "generate", "predict", "fit",
+            "build_adapter", "forward_denoise", "run", "evaluate",
+        }
+        missing_key_methods: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            key_methods = spec.get("key_methods", [])
+            if not isinstance(key_methods, list):
+                continue
+            missing = []
+            for key_method in key_methods:
+                if not isinstance(key_method, str):
+                    continue
+                key_method = key_method.strip()
+                if not key_method or key_method in generic_key_methods:
+                    continue
+                if not re.search(rf"\bdef\s+{re.escape(key_method)}\b|\b{re.escape(key_method)}\b", code):
+                    missing.append(key_method)
+            if missing:
+                missing_key_methods[method_name] = missing
+        if missing_key_methods:
+            preview = []
+            for method_name, missing in list(missing_key_methods.items())[:4]:
+                preview.append(f"{method_name}: {', '.join(missing[:3])}")
+            violations.append(
+                "MISSING DISTINCTIVE KEY METHODS: implementation_spec declares differentiator-specific helper methods "
+                "that never appear in code: " + " | ".join(preview)
+                + ". Methods that rely on prompt swaps, intervention pairing, selective unfreezing, or multi-concept sampling "
+                  "must expose those algorithmic steps in code, not just in plan metadata."
+            )
+
+        # 2h2. required_distinct_helpers must be both defined and called.
+        missing_required_helper_usage: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            helpers = spec.get("required_distinct_helpers", [])
+            if not isinstance(helpers, list):
+                continue
+            missing = []
+            for helper in helpers:
+                if not isinstance(helper, str):
+                    continue
+                helper = helper.strip()
+                if not helper:
+                    continue
+                helper_aliases = {
+                    "strict_normalization": (
+                        "compute_normalization_params", "normalize_data", "standardscaler",
+                    ),
+                }
+                aliases = helper_aliases.get(helper.lower(), (helper,))
+                implemented = any(
+                    (_symbol_is_defined(alias) and _symbol_is_called(alias))
+                    or alias.lower() in code.lower()
+                    for alias in aliases
+                )
+                if not implemented:
+                    missing.append(helper)
+            if missing:
+                missing_required_helper_usage[method_name] = missing
+        if missing_required_helper_usage:
+            preview = []
+            for method_name, missing in list(missing_required_helper_usage.items())[:4]:
+                preview.append(f"{method_name}: {', '.join(missing[:3])}")
+            violations.append(
+                "UNUSED DISTINCTIVE HELPERS: plan declares `required_distinct_helpers` that are not both defined and used "
+                "in the execution path: " + " | ".join(preview)
+                + ". Distinctive helper names are part of the implementation contract, not documentation only."
+            )
+
+        # 2i. Nontrivial plan hyperparameters must be used in runtime logic, not only stored in config structs.
+        param_to_methods: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            hyper = spec.get("key_hyperparameters", {})
+            if not isinstance(hyper, dict):
+                continue
+            for param_name, value in hyper.items():
+                if _is_meaningful_runtime_param(str(param_name), value):
+                    param_to_methods.setdefault(str(param_name), []).append(method_name)
+        for param_name, methods in sorted(param_to_methods.items()):
+            patterns = _param_usage_patterns(param_name)
+            if not any(re.search(pattern, code) for pattern in patterns):
+                violations.append(
+                    f"UNUSED ALGORITHMIC PARAMETER: plan defines runtime-significant `{param_name}` for methods "
+                    f"{', '.join(methods[:4])}"
+                    f"{', ...' if len(methods) > 4 else ''}, but code never uses it in training/evaluation logic. "
+                    "Do not declare regularizers, layer selections, or concept modes in the plan unless the code actually applies them."
+                )
+
+        # 2j. required_loss_terms must be reflected in code, not only prose/plan metadata.
+        missing_loss_terms: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            terms = spec.get("required_loss_terms", [])
+            if not isinstance(terms, list):
+                continue
+            missing = []
+            for term in terms:
+                if not isinstance(term, str):
+                    continue
+                term = term.strip()
+                if not term:
+                    continue
+                if not any(re.search(pattern, code.lower()) for pattern in _loss_term_patterns(term)):
+                    missing.append(term)
+            if missing:
+                missing_loss_terms[method_name] = missing
+        if missing_loss_terms:
+            preview = []
+            for method_name, missing in list(missing_loss_terms.items())[:4]:
+                preview.append(f"{method_name}: {', '.join(missing[:3])}")
+            violations.append(
+                "MISSING REQUIRED LOSS TERMS: plan declares `required_loss_terms` that do not appear in code: "
+                + " | ".join(preview)
+                + ". If a method requires extra regularization or comparison branches, the code must expose those loss terms."
+            )
+
+        # 2k. required_data_pairing should surface in data construction / sampling logic.
+        missing_pairing_logic: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            pairing = spec.get("required_data_pairing")
+            if isinstance(pairing, list):
+                pairings = [str(p).strip() for p in pairing if str(p).strip()]
+            elif isinstance(pairing, str) and pairing.strip():
+                pairings = [pairing.strip()]
+            else:
+                pairings = []
+            missing = []
+            for pairing_name in pairings:
+                patterns = _data_pairing_patterns(pairing_name)
+                if patterns and not any(re.search(pattern, code.lower()) for pattern in patterns):
+                    missing.append(pairing_name)
+            if missing:
+                missing_pairing_logic[method_name] = missing
+        if missing_pairing_logic:
+            preview = []
+            for method_name, missing in list(missing_pairing_logic.items())[:4]:
+                preview.append(f"{method_name}: {', '.join(missing[:3])}")
+            violations.append(
+                "MISSING DATA PAIRING LOGIC: plan declares `required_data_pairing` but code does not expose the corresponding sampling/pairing branch: "
+                + " | ".join(preview)
+                + ". Methods that depend on prompt swaps, intervention pairs, or related/unrelated concept grouping must implement that data logic explicitly."
+            )
+
+        # 2l. required_model_edits should appear in structural model manipulation code.
+        missing_model_edits: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            edits = spec.get("required_model_edits", [])
+            if isinstance(edits, str):
+                edits = [edits]
+            if not isinstance(edits, list):
+                continue
+            missing = []
+            for edit_name in edits:
+                if not isinstance(edit_name, str):
+                    continue
+                edit_name = edit_name.strip()
+                if not edit_name:
+                    continue
+                if edit_name.lower() == "none":
+                    continue
+                if not any(re.search(pattern, code.lower()) for pattern in _model_edit_patterns(edit_name)):
+                    missing.append(edit_name)
+            if missing:
+                missing_model_edits[method_name] = missing
+        if missing_model_edits:
+            preview = []
+            for method_name, missing in list(missing_model_edits.items())[:4]:
+                preview.append(f"{method_name}: {', '.join(missing[:3])}")
+            violations.append(
+                "MISSING MODEL EDITS: plan declares `required_model_edits` but code does not show the corresponding structural intervention: "
+                + " | ".join(preview)
+                + ". Monkey patches, module replacement, selective unfreezing, adapter attachment, and structural edits must be visible in code."
+            )
+
+        # 2m. required_runtime_hooks should appear in hook registration / interception code.
+        missing_runtime_hooks: dict[str, list[str]] = {}
+        for method_name, spec in impl_specs.items():
+            hooks = spec.get("required_runtime_hooks", [])
+            if isinstance(hooks, str):
+                hooks = [hooks]
+            if not isinstance(hooks, list):
+                continue
+            missing = []
+            for hook_name in hooks:
+                if not isinstance(hook_name, str):
+                    continue
+                hook_name = hook_name.strip()
+                if not hook_name:
+                    continue
+                if hook_name.lower() == "none":
+                    continue
+                if not any(re.search(pattern, code.lower()) for pattern in _runtime_hook_patterns(hook_name)):
+                    missing.append(hook_name)
+            if missing:
+                missing_runtime_hooks[method_name] = missing
+        if missing_runtime_hooks:
+            preview = []
+            for method_name, missing in list(missing_runtime_hooks.items())[:4]:
+                preview.append(f"{method_name}: {', '.join(missing[:3])}")
+            violations.append(
+                "MISSING RUNTIME HOOKS: plan declares `required_runtime_hooks` but code never installs the corresponding hooks/interception points: "
+                + " | ".join(preview)
+                + ". Hidden-state tracing or monkey-patched execution paths must register actual hooks or patch targets in code."
+            )
+
+        # 3. Check training: if plan specifies training steps, code must have training loop
+        training_contract = plan_data.get("training", {}) if isinstance(plan_data, dict) else {}
+        if training_contract:
+            has_training = any(kw in code for kw in (
+                "loss.backward()", "optimizer.step()", "train()",
+            ))
+            if not has_training:
+                violations.append(
+                    "MISSING TRAINING: Plan specifies training but code has no "
+                    "training loop (no loss.backward() or optimizer.step() found). "
+                    "You MUST include the full training loop as specified in the plan."
+                )
+
+        # 3b. S11 code must support a lightweight smoke mode without changing algorithm semantics.
+        if any(kw in plan for kw in ("training", "evaluation", "max_steps", "num_frames")):
+            if "smoke_test" not in code.lower():
+                violations.append(
+                    "MISSING SMOKE MODE: main.py must support `SMOKE_TEST=1` for lightweight verification "
+                    "while keeping the default execution path as the full experiment."
+                )
+
+        # 4. Check each condition is genuinely different (not copy-paste)
+        # Extract function bodies and compare
+        func_bodies: dict[str, str] = {}
+        for match in re.finditer(
+            r'^def (\w+)\(.*?\):\s*\n((?:[ \t]+.*\n)*)',
+            code, re.MULTILINE,
+        ):
+            fname = match.group(1)
+            body = match.group(2).strip()
+            if fname.startswith("lora_") or fname.startswith("baseline"):
+                # Normalize: remove comments, whitespace variations
+                normalized = re.sub(r'#.*$', '', body, flags=re.MULTILINE)
+                normalized = re.sub(r'\s+', ' ', normalized).strip()
+                func_bodies[fname] = normalized
+
+        # Check for duplicate function bodies
+        seen_bodies: dict[str, str] = {}
+        for fname, body in func_bodies.items():
+            # Compare ignoring small differences (numbers, variable names)
+            body_sig = re.sub(r'\d+', 'N', body)[:500]
+            for prev_name, prev_sig in seen_bodies.items():
+                if body_sig == prev_sig:
+                    violations.append(
+                        f"DUPLICATE CONDITION: '{fname}' has identical logic to '{prev_name}'. "
+                        f"Each condition MUST implement a genuinely different algorithm."
+                    )
+                    break
+            seen_bodies[fname] = body_sig
+
+        return violations
+
+    @staticmethod
+    def _summarize_input(tool_name: str, inp: dict[str, Any]) -> str:
+        """One-line summary of tool input for logging."""
+        if tool_name == "bash":
+            cmd = inp.get("command", "")
+            return cmd[:80] + ("..." if len(cmd) > 80 else "")
+        elif tool_name in ("write_file", "edit_file"):
+            path = inp.get("path", "?")
+            size = len(inp.get("content", inp.get("new_string", "")))
+            return f"{path} ({size} chars)"
+        elif tool_name == "read_file":
+            return inp.get("path", "?")
+        elif tool_name in ("glob_search", "grep_search"):
+            return inp.get("pattern", "?")
+        return json.dumps(inp)[:80]
+
+    def _save_conversation_log(self) -> None:
+        """Save conversation history in two formats for debugging.
+
+        1. ``turn_loop_conversation.json`` — full messages (truncated for size)
+        2. ``turn_loop_conversation_full.json`` — completely untruncated
+        """
+        trace_dir = self._workspace.parent if self._workspace.parent.is_dir() else self._workspace
+
+        # Full untruncated conversation (for deep debugging)
+        try:
+            full_path = trace_dir / "turn_loop_conversation_full.json"
+            full_path.write_text(
+                json.dumps(self._messages, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        # Truncated version (for quick inspection)
+        try:
+            log_path = trace_dir / "turn_loop_conversation.json"
+            safe_messages = []
+            for msg in self._messages:
+                safe = dict(msg)
+                content = safe.get("content", "")
+                if isinstance(content, str) and len(content) > 3000:
+                    safe["content"] = content[:3000] + f"\n... [{len(content)} total chars]"
+                # Also truncate tool_calls arguments
+                if "tool_calls" in safe:
+                    for tc in safe.get("tool_calls", []):
+                        if isinstance(tc, dict):
+                            fn = tc.get("function", {})
+                            args = fn.get("arguments", "")
+                            if isinstance(args, str) and len(args) > 2000:
+                                fn["arguments"] = args[:2000] + f"... [{len(args)} total]"
+                safe_messages.append(safe)
+
+            log_path.write_text(
+                json.dumps(safe_messages, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass

@@ -1,0 +1,115 @@
+project:
+  name: local-claw-ai-lab
+  mode: full-auto
+research:
+  topic: local test topic
+  domains:
+  - deep-learning
+  daily_paper_count: 5
+  idea_count: 5
+  quality_threshold: 3.0
+  reference_papers: []
+notifications:
+  channel: console
+  on_stage_start: true
+  on_gate_required: true
+knowledge_base:
+  backend: markdown
+  root: docs/kb
+openclaw_bridge:
+  use_message: false
+  use_memory: false
+  use_web_fetch: false
+review_llm:
+  provider: openai-compatible
+  base_url: http://<your-llm-endpoint>/v1
+  api_key: <your-api-key>
+  api_key_env: RESEARCHCLAW_API_KEY
+  primary_model: Qwen3.5-122B-A10B-FP8
+  fallback_models: []
+  timeout_sec: 300
+  max_retries: 2
+  strip_thinking: true
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
+llm:
+  provider: openai-compatible
+  base_url: http://<your-llm-endpoint>/v1
+  api_key: <your-api-key>
+  api_key_env: RESEARCHCLAW_API_KEY
+  primary_model: Qwen3.5-122B-A10B-FP8
+  coding_model: Qwen3.5-122B-A10B-FP8
+  image_model: Qwen3.5-122B-A10B-FP8
+  fallback_models: []
+  timeout_sec: 300
+  max_retries: 3
+  strip_thinking: true
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+web_chat_llm:
+  provider: openai-compatible
+  base_url: http://<your-llm-endpoint>/v1
+  api_key: <your-api-key>
+  api_key_env: RESEARCHCLAW_API_KEY
+  primary_model: Qwen3.5-122B-A10B-FP8
+  fallback_models: []
+  max_tokens: 16384
+  timeout_sec: 120
+  max_retries: 1
+  strip_thinking: true
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+web_chat_llm_fallbacks:
+- provider: openai-compatible
+  base_url: http://<your-llm-endpoint>/v1
+  api_key: <your-api-key>
+  api_key_env: RESEARCHCLAW_API_KEY
+  primary_model: Qwen3.5-122B-A10B-FP8
+  fallback_models: []
+  max_tokens: 8192
+  timeout_sec: 20
+  max_retries: 1
+  strip_thinking: true
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+security:
+  hitl_required_stages: []
+experiment:
+  mode: sandbox
+  time_budget_sec: 2400
+  max_iterations: 3
+  metric_key: primary_metric
+  metric_direction: minimize
+  datasets_dir: ''
+  checkpoints_dir: ''
+  codebases_dir: ''
+  shared_results_dir: runs/shared_results
+  paper_length: long
+  sandbox:
+    python_path: /opt/conda/envs/clawailab/bin/python
+  sanity_check_max_iterations: 100
+  figure_agent:
+    nano_banana_enabled: false
+runtime:
+  timezone: Asia/Shanghai
+idea_judge_llm:
+  provider: openai-compatible
+  base_url: http://<your-llm-endpoint>/v1
+  api_key: <your-api-key>
+  api_key_env: RESEARCHCLAW_API_KEY
+  primary_model: Qwen3.5-122B-A10B-FP8
+  timeout_sec: 120
+  max_retries: 1
+  strip_thinking: true
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+web_search:
+  enabled: true
+prompts:
+  custom_file: ''

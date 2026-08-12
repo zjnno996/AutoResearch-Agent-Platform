@@ -1,0 +1,516 @@
+"""System prompt builder for the claw-code agentic turn loop.
+
+Ported from claw-code ``rust/crates/runtime/src/prompt.rs``
+``SystemPromptBuilder``. Uses the same section ordering:
+
+  Intro → System → Doing tasks → Executing actions
+  ── DYNAMIC BOUNDARY ──
+  Environment → Experiment → Data paths → Constraints
+
+Tools are NOT embedded here — they go via the API ``tools`` field.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from researchclaw.pipeline.codegen.types import CodegenContext
+
+DYNAMIC_BOUNDARY = "────────────────────────────────────────"
+
+_workspace_path: str = ""
+
+
+def set_workspace_path(path: str) -> None:
+    """Set the actual workspace path so the system prompt can include it."""
+    global _workspace_path
+    _workspace_path = path
+
+
+def _plan_dict(ctx: CodegenContext) -> dict[str, Any]:
+    try:
+        import yaml
+
+        parsed = yaml.safe_load(ctx.exp_plan or "") or {}
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _requested_seeds(ctx: CodegenContext) -> list[int]:
+    parsed = _plan_dict(ctx)
+    protocol = parsed.get("evaluation_protocol", {})
+    requested = protocol.get("independent_seeds", []) if isinstance(protocol, dict) else []
+    seeds = [value for value in requested if isinstance(value, int)] if isinstance(requested, list) else []
+    return seeds or [42, 123, 456]
+
+
+def _requires_pretrained_model(ctx: CodegenContext) -> bool:
+    """Whether the executable plan actually calls for a pretrained model."""
+    if ctx.checkpoints_dir:
+        return True
+    import json
+
+    parsed = _plan_dict(ctx)
+    proposed = parsed.get("proposed_methods", [])
+    baselines = parsed.get("baselines", [])
+    executable = json.dumps(
+        {"proposed_methods": proposed, "baselines": baselines},
+        ensure_ascii=False,
+    ).lower()
+    pretrained_tokens = (
+        "pretrained", "from_pretrained", "checkpoint", "diffusion", "transformer",
+        "resnet", "vit", "clip", "llm", "cnn", "lstm",
+    )
+    if any(token in executable for token in pretrained_tokens):
+        return True
+    classical_tokens = (
+        "sklearn", "sgdclassifier", "randomforestclassifier", "linear sgd",
+        "random forest", "随机森林",
+    )
+    if not proposed and any(token in executable for token in classical_tokens):
+        return False
+    return True
+
+
+def build_system_prompt(ctx: CodegenContext) -> str:
+    """Build the full system prompt from context.
+
+    Follows claw-code's ``SystemPromptBuilder.build()`` section order.
+    """
+    sections: list[str] = [
+        _intro_section(),
+        _system_section(),
+        _doing_tasks_section(),
+        _actions_section(),
+        _anti_simulation_section(ctx),
+        DYNAMIC_BOUNDARY,
+        _environment_section(ctx),
+        _experiment_section(ctx),
+        _data_paths_section(ctx),
+        _project_instructions_section(ctx),
+        _constraints_section(ctx),
+    ]
+    return "\n\n".join(s for s in sections if s)
+
+
+def build_user_message(ctx: CodegenContext) -> str:
+    """Build the initial user message that starts the agent loop."""
+    md = "lower" if ctx.metric_direction == "minimize" else "higher"
+    seeds = _requested_seeds(ctx)
+    if _requires_pretrained_model(ctx):
+        implementation_guidance = """- Inspect configured checkpoints and model metadata before selecting a loader.
+  - Load the real model with the class required by its metadata via a validated API.
+  - Never replace a planned neural model with a toy nn.Linear or randomly initialized stand-in."""
+        implementation_check = "model/checkpoint loading API"
+    else:
+        implementation_guidance = """- This is a classical-ML plan: do NOT introduce a pretrained neural model.
+  - Implement exactly the estimators listed in EXPERIMENT_PLAN.yaml with their specified hyperparameters.
+  - Download/load the official dataset, use its official split, and never substitute synthetic data."""
+        implementation_check = "requested scikit-learn estimator APIs"
+    return f"""Generate a complete experiment for the following research topic.
+
+TOPIC: {ctx.topic}
+PRIMARY METRIC: {ctx.metric} (direction: {ctx.metric_direction} — {md} is better)
+TIME BUDGET: {ctx.time_budget_sec} seconds
+
+Your workspace contains two critical files — read them FIRST before writing any code:
+ - `CODEGEN.md` — project-specific instructions: model loading code, dataset format, evaluation protocol, technical guidance
+ - `EXPERIMENT_PLAN.yaml` — full experiment plan with all conditions, training details, and evaluation protocol
+
+STEP-BY-STEP WORKFLOW:
+
+Step 1 — EXPLORE (mandatory before writing any code):
+  - Read CODEGEN.md and EXPERIMENT_PLAN.yaml before writing code.
+  - Inspect configured dataset, checkpoint, and codebase paths when present.
+  - If a required public dataset is absent, implement a real download with source metadata and a manifest.
+  - Do not infer executable requirements from rejected suggestions, risks, or historical rationale.
+
+Step 2 — DESIGN from the executable plan:
+  {implementation_guidance}
+  - Apply exactly these seeds to every condition: {seeds}.
+  - Compute only requested metrics from actual predictions or model outputs.
+
+Step 3 — WRITE main.py using write_file:
+  - Implement every executable condition and no unrequested methods.
+  - `python3 main.py` must run the FULL experiment specified in `EXPERIMENT_PLAN.yaml`
+  - `SMOKE_TEST=1 python3 main.py` must run a LIGHTWEIGHT verification path using the SAME algorithms
+  - Smoke mode may only reduce counts (steps / prompts / seeds / inference steps); it must NOT remove conditions, swap algorithms, or use fake metrics
+  - Retain per-seed raw results before computing summaries, confidence intervals, or statistical tests.
+  - Print "{ctx.metric}: <value>" for each condition and seed
+  - Save project-appropriate artifacts to outputs/ based on the task modality and plan
+
+Step 4 — VERIFY (quick smoke test only):
+  - Run a QUICK syntax + import check: `python3 -c "import main; print('imports OK')"`
+  - If that passes, run a SHORT smoke test: `timeout 30 env SMOKE_TEST=1 python3 main.py` (30 second limit)
+  - The purpose is ONLY to catch import errors, syntax errors, and obvious crashes
+  - Do NOT wait for the full experiment to finish during S11 verification
+  - If the test shows data loading and real evaluation starting, that is sufficient for this runtime gate.
+  - Fix import, download, parsing, split, and estimator errors instead of hiding them.
+
+Step 5 — ANTI-SIMULATION SELF-CHECK (mandatory before finishing):
+  - Verify main.py contains no mock functions or random metric generation.
+  - Verify main.py uses the {implementation_check} required by the executable plan.
+  - If either check fails, rewrite the code with a real implementation.
+
+Step 6 — VERIFY outputs:
+  - Check that outputs/ contains at least one project-appropriate artifact
+    (for example: PNG/JPG for image tasks, MP4/GIF or representative frame sequences for video tasks,
+    WAV for audio tasks, plots/tables for analysis-heavy tasks)
+  - Check that the printed primary metric is a real number only when the required supervision/annotations actually exist
+  - If an optional metric cannot run offline, print an explicit skipped status/reason instead of NaN or a fake number
+  - Any report/summary/output JSON must contain only measured results or explicit skipped/not-implemented statuses; do NOT copy plan metadata into outputs to make the experiment look complete
+
+CRITICAL RULES:
+- Use real data and exactly the executable methods in EXPERIMENT_PLAN.yaml.
+- Do not add methods from risks, rejected suggestions, literature context, or examples.
+- When exploring data or checkpoints, ALWAYS pass the configured ABSOLUTE directory via the tool `path` field, e.g. `glob_search(path=CHECKPOINTS_DIR, pattern="**/*")` or `read_file(path="/abs/path/to/file")`
+- Do NOT rely on workspace symlinks like `datasets/` or `checkpoints/` to discover files; they may be absent, stale, or skipped by recursive globbing
+- NO try/except blocks around model loading or training — if it crashes, we need the traceback
+- The ONLY place try/except is allowed is inside a save_outputs() function for file I/O
+- NO hardcoded fallback metrics — if the model fails, the code must crash, not return fake numbers
+- NO heuristic "human labels" or "ground truth" derived from prompt text, filenames, paths, or clip IDs unless the plan explicitly defines those strings as the label source
+- NO copying plan fields into summary/report/output files unless those values are computed from actual execution
+- NO argparse — hardcode all parameters as constants
+- NO mock functions — every metric must come from real model computation
+- Default execution (`python3 main.py`) must run the FULL experiment plan
+- Smoke execution (`SMOKE_TEST=1 python3 main.py`) must use the SAME code path with only smaller counts
+- If a condition mutates model state (training / LoRA attach), isolate conditions and seeds by reloading or deep-copying the base model as needed
+- Use exactly {len(seeds)} seeds ({', '.join(map(str, seeds))}) as specified by the experiment plan
+- Complete within the time budget ({ctx.time_budget_sec}s)"""
+
+
+# ------------------------------------------------------------------
+# Static sections (ported from claw-code prompt.rs)
+# ------------------------------------------------------------------
+
+def _intro_section() -> str:
+    return (
+        "You are a research coding agent that generates experiment code by using tools. "
+        "You have access to bash, read_file, write_file, edit_file, glob_search, and grep_search. "
+        "Use these tools to explore the workspace, write experiment code, run it, and fix errors "
+        "iteratively until the experiment produces valid results.\n\n"
+        "IMPORTANT: Do NOT describe what you plan to do — just DO it by calling tools. "
+        "Every response should include at least one tool call until the experiment is complete."
+    )
+
+
+def _system_section() -> str:
+    return (
+        "# System\n"
+        " - All text you output outside of tool use is logged but not shown to the user.\n"
+        " - Tools execute in a sandboxed workspace with limited permissions.\n"
+        " - Tool results may be truncated for large outputs — use offset/limit for big files.\n"
+        " - bash commands run with a timeout; long-running processes will be killed.\n"
+        " - File writes are restricted to the workspace directory.\n"
+        " - File reads are allowed in the workspace and configured data directories."
+    )
+
+
+def _doing_tasks_section() -> str:
+    return (
+        "# Doing tasks\n"
+        " - Read relevant code and data before writing — understand the codebase API first.\n"
+        " - Keep changes tightly scoped: fix one thing at a time.\n"
+        " - Do not add speculative abstractions or unrelated cleanup.\n"
+        " - If an approach fails, diagnose the failure before switching tactics.\n"
+        " - Use edit_file for targeted fixes instead of rewriting entire files.\n"
+        " - After writing code, ALWAYS run it with bash to verify it works.\n"
+        " - Report outcomes faithfully: if verification fails, fix it rather than ignoring."
+    )
+
+
+def _actions_section() -> str:
+    return (
+        "# Executing actions with care\n"
+        "Write code incrementally: create the skeleton first, test it, then add complexity. "
+        "If a bash command fails, read the error carefully and fix the root cause. "
+        "Never mask errors with try/except — the experiment must crash cleanly so errors "
+        "can be diagnosed.\n\n"
+        "CRITICAL — S11 MUST PRODUCE DUAL-MODE EXPERIMENT CODE:\n"
+        " - `python3 main.py` must execute the FULL experiment described by the plan.\n"
+        " - `SMOKE_TEST=1 python3 main.py` must execute a LIGHTWEIGHT verification path.\n"
+        " - Smoke mode may only shrink counts (steps, prompts, seeds, inference steps); it must NOT change algorithms.\n"
+        " - Verify with a QUICK smoke test only: `timeout 30 env SMOKE_TEST=1 python3 main.py`\n"
+        " - Smoke-test success is only a runtime gate; it does NOT justify inventing labels, fake summaries, or claiming unimplemented methods are complete.\n"
+        " - If the smoke test shows model loading + evaluation starting + first training step starting, that is sufficient for runtime verification only.\n"
+        " - Do NOT remove training/evaluation code because the smoke test times out.\n"
+        " - If OOM during smoke test → reduce only smoke-mode counts or batch size. Keep the full experiment path intact.\n"
+        " - Once code is verified (imports work, model loads, training starts), STOP calling tools only if the implementation is also honest about missing supervision, missing methods, and skipped metrics."
+    )
+
+
+def _anti_simulation_section(ctx: CodegenContext) -> str:
+    if not _requires_pretrained_model(ctx):
+        return """# ANTI-SIMULATION RULES (MANDATORY — VIOLATION = EXPERIMENT REJECTED)
+
+This plan requests classical machine-learning estimators, not a pretrained neural model.
+Use the exact requested production estimators (for example scikit-learn SGDClassifier
+and RandomForestClassifier) on the real dataset.
+
+## Forbidden Patterns (instant rejection)
+ - Synthetic or randomly generated replacement data when the official dataset is required
+ - `np.random.uniform` / `torch.rand` to generate fake metric values
+ - Functions named `compute_*_mock` or `*_mock`
+ - Any function that returns a hardcoded or random number as a metric
+ - Writing plan metadata into outputs as if it were measured experimental output
+ - Listing an estimator in outputs if it was not fitted and evaluated
+
+## Required Patterns (must be present)
+ - Download or load the official dataset and retain a verifiable source/data manifest
+ - Fit and predict with each exact estimator requested by EXPERIMENT_PLAN.yaml
+ - Compute metrics from true labels and predictions using a validated library
+ - Retain per-seed raw results before computing summaries or statistical tests
+ - Clearly distinguish measured results from skipped or unavailable results
+
+## Self-Verification Protocol
+Verify that main.py imports and executes the requested estimator classes, reads real
+dataset files, and contains no mock functions or random metric generation."""
+
+    return """# ANTI-SIMULATION RULES (MANDATORY — VIOLATION = EXPERIMENT REJECTED)
+
+You MUST use REAL pretrained models for experiments. The following patterns are
+STRICTLY FORBIDDEN and will cause the experiment to be rejected:
+
+## Forbidden Patterns (instant rejection)
+ - `torch.nn.Linear` as a substitute for a real model (SD, ViT, ResNet, LLM, etc.)
+ - `torch.nn.Sequential(Conv2d, ReLU, Conv2d)` as a "feature extractor" replacing a real model
+ - `np.random.uniform` / `torch.rand` to generate fake metric values
+ - `output.mean()` as a training loss (meaningless optimization target)
+ - Functions named `compute_*_mock` or `*_mock` — no mock implementations allowed
+ - Flattening images to 1D vectors and feeding them to Linear layers
+ - Any function that returns a hardcoded or random number as a metric
+ - `try/except` around model loading/training that returns hardcoded fallback metrics
+ - `except: pass` or `except: return` with fake values — if the model fails to load, the code MUST crash
+ - Loading a model with the WRONG class — always read config/metadata files first to determine the correct loader
+ - Deriving `human_rating`, `label`, `ground_truth`, or equivalent supervision from prompts, filenames, paths, or clip IDs unless the plan explicitly defines that mapping
+ - Writing plan metadata into summary/report/output files as if it were measured experimental output
+ - Listing a method in outputs/reports if that method is not actually executed
+
+## Required Patterns (must be present)
+ - Load a REAL pretrained model via the appropriate library API (e.g. `from_pretrained`, `torch.hub.load`, etc.)
+ - Use REAL evaluation metrics from a validated library — not hand-rolled approximations
+ - Training must use a proper task-specific loss — NOT `output.mean()`
+ - If CHECKPOINTS_DIR contains model weights, you MUST load them with the appropriate library
+ - Every metric in the return dict must be computed from real data, NEVER hardcoded to 0.0 or any constant
+ - If required labels/annotations are missing, explicitly mark the affected metric/method as skipped or not implemented
+ - Final output artifacts must clearly distinguish measured results from plan metadata and from skipped items
+
+## Self-Verification Protocol
+After writing main.py, you MUST verify it is not a simulation by running:
+```bash
+grep -n "nn.Linear" main.py | grep -v "lora\\|adapter\\|projection\\|head\\|classifier"
+```
+If this finds any `nn.Linear` used as the primary model, the code is a simulation and MUST be rewritten.
+
+Also verify:
+```bash
+grep -n "mock\\|_mock\\|random.uniform\\|np.random" main.py
+```
+If this finds mock functions or random metric generation, rewrite with real implementations."""
+
+
+# ------------------------------------------------------------------
+# Dynamic sections (experiment-specific context)
+# ------------------------------------------------------------------
+
+def _environment_section(ctx: CodegenContext) -> str:
+    lines = ["# Environment"]
+    ws = _workspace_path or str(ctx.stage_dir or "workspace")
+    lines.append(f" - Working directory: `{ws}`")
+    lines.append(f" - IMPORTANT: Use RELATIVE paths for write_file (e.g. `main.py`, NOT `/workspace/main.py`)")
+    lines.append(f"   All write_file/edit_file calls use the working directory as base.")
+    lines.append(f"   bash commands also run in this directory.")
+    lines.append(f" - Mode: {ctx.mode}")
+
+    if ctx.hw_profile and ctx.hw_profile.has_gpu:
+        hw = ctx.hw_profile
+        lines.append(f" - GPU: {hw.gpu_name} ({hw.gpu_type})")
+        if hw.gpu_type == "npu":
+            lines.append(" - CRITICAL: Huawei Ascend NPU — use `import torch_npu` and `device = torch.device('npu')`")
+        else:
+            lines.append(f" - Use `device = torch.device('{hw.gpu_type}')`")
+    else:
+        lines.append(" - No GPU detected — design CPU-friendly experiments")
+
+    if ctx.pkg_hint:
+        lines.append(f"\n{ctx.pkg_hint}")
+
+    return "\n".join(lines)
+
+
+def _experiment_section(ctx: CodegenContext) -> str:
+    lines = ["# Experiment"]
+    lines.append(f" - Topic: {ctx.topic}")
+    lines.append(f" - Primary metric: {ctx.metric} (direction: {ctx.metric_direction})")
+    lines.append(f" - Time budget: {ctx.time_budget_sec}s per run")
+    if ctx.compute_budget:
+        lines.append(ctx.compute_budget)
+    return "\n".join(lines)
+
+
+def _data_paths_section(ctx: CodegenContext) -> str:
+    """Minimal data path pointers — detailed info is in CODEGEN.md."""
+    lines = ["# Available data paths"]
+    has_any = False
+
+    if ctx.checkpoints_dir:
+        lines.append(f" - Checkpoints: `{ctx.checkpoints_dir}`")
+        lines.append(
+            f"   Use tools with `path=\"{ctx.checkpoints_dir}\"` when exploring checkpoint files."
+        )
+        has_any = True
+    if ctx.datasets_dir:
+        lines.append(f" - Datasets: `{ctx.datasets_dir}`")
+        lines.append(
+            f"   Use tools with `path=\"{ctx.datasets_dir}\"` when exploring dataset files."
+        )
+        has_any = True
+    if ctx.codebases_dir:
+        lines.append(f" - Codebases: `{ctx.codebases_dir}`")
+        lines.append(
+            f"   Use tools with `path=\"{ctx.codebases_dir}\"` when exploring reusable source files."
+        )
+        has_any = True
+
+    if not has_any:
+        lines.append(
+            " - No pre-configured data paths — download the public dataset required by the plan. "
+            "Use synthetic data only when the experiment plan explicitly requests a synthetic-data condition."
+        )
+    else:
+        lines.append(
+            " - CRITICAL: These are absolute source paths. Pass them explicitly to `glob_search` / `read_file`; do NOT search only inside the workspace."
+        )
+
+    lines.append("See CODEGEN.md for detailed model/dataset info. Use glob_search and read_file to explore.")
+    return "\n".join(lines)
+
+
+def _project_instructions_section(ctx: CodegenContext) -> str:
+    """Lightweight pointer to workspace instruction files.
+
+    CODEGEN.md is generated directly in the workspace by _prepare_workspace.
+    We only add a brief pointer here — the agent reads the full file on-demand.
+    """
+    return (
+        "# Project instructions\n"
+        "Your workspace contains `CODEGEN.md` with project-specific instructions: "
+        "model loading code, dataset format, evaluation protocol, and technical guidance.\n"
+        "Read it with `read_file` BEFORE writing any code."
+    )
+
+
+def _extract_plan_hints(plan_text: str) -> list[str]:
+    """Analyze the experiment plan and generate targeted technical hints.
+
+    This replaces hardcoded advice: hints are only generated for technologies
+    actually mentioned in the plan. Different plans get different hints.
+    """
+    if not plan_text:
+        return []
+
+    # Do not scan the whole YAML blob.  Risks, rejected benchmark suggestions,
+    # citations, and historical rationale often mention unrelated technology
+    # (for example FID or CNN-LSTM) and used to inject bogus code requirements.
+    try:
+        import json
+        import yaml
+
+        parsed = yaml.safe_load(plan_text)
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except Exception:  # noqa: BLE001
+        parsed = {}
+    metrics_lower = json.dumps(
+        {
+            "metrics": parsed.get("metrics", []),
+            "evaluation": parsed.get("evaluation", {}),
+            "primary_metric": parsed.get("primary_metric", ""),
+        },
+        ensure_ascii=False,
+    ).lower() if parsed else ""
+    methods_lower = json.dumps(
+        {
+            "methods": parsed.get("methods", {}),
+            "proposed_methods": parsed.get("proposed_methods", []),
+            "baselines": parsed.get("baselines", []),
+        },
+        ensure_ascii=False,
+    ).lower() if parsed else ""
+    training = parsed.get("training", {}) if parsed else {}
+    training_lower = json.dumps(training, ensure_ascii=False).lower() if training else ""
+    hints: list[str] = []
+
+    if "lora" in methods_lower or "lora" in training_lower:
+        hints.append(
+            "LoRA detected: use `peft.LoraConfig` applied to a REAL pretrained model. "
+            "NEVER apply LoRA to a bare nn.Linear — it must wrap a real model's layers."
+        )
+        if "adaptive" in methods_lower or "rank_pattern" in methods_lower or "per-layer" in methods_lower:
+            hints.append(
+                "Adaptive/per-layer LoRA ranks detected: peft does NOT support `rank_pattern` in LoraConfig. "
+                "Instead, apply multiple LoraConfig objects with different `r` values and `adapter_name` parameters. "
+                "Example: group layers by depth, then `model.add_adapter(LoraConfig(r=8, ...), adapter_name='early')` "
+                "and `model.add_adapter(LoraConfig(r=32, ...), adapter_name='late')`. "
+                "NEVER just set `module.r = 32` on an existing adapter — that does NOT change the matrix shape."
+            )
+
+    if "clip" in metrics_lower and ("score" in metrics_lower or "metric" in metrics_lower):
+        hints.append(
+            "CLIP score metric detected: use `torchmetrics.multimodal.CLIPScore` with a real CLIP model. "
+            "If network is unavailable, use a locally cached CLIP model or omit the metric entirely. "
+            "NEVER return a hardcoded clip_score value or `NaN` without an explicit skipped reason."
+        )
+
+    if "fid" in metrics_lower:
+        hints.append(
+            "FID metric detected: use `torchmetrics.image.fid.FrechetInceptionDistance`. "
+            "FID requires reference (real) images and generated images — ensure both sets exist. "
+            "If reference images are not available, skip FID rather than returning a fake value."
+        )
+
+    if "diffus" in methods_lower:
+        hints.append(
+            "Diffusion model detected: load using `DiffusionPipeline.from_pretrained()` which auto-detects "
+            "the correct pipeline class from model_index.json. Do NOT hardcode StableDiffusionPipeline "
+            "unless model_index.json specifically indicates that class."
+        )
+
+    if "video" in methods_lower or "i2v" in methods_lower or "t2v" in methods_lower:
+        hints.append(
+            "Video generation detected: video pipelines produce frame sequences, not single images. "
+            "Ensure metrics handle video tensors (B, T, C, H, W) correctly."
+        )
+
+    if training and ("loss" in training_lower or "fine-tun" in training_lower or "finetun" in training_lower):
+        hints.append(
+            "Training/fine-tuning detected: use a task-appropriate loss function (diffusion noise loss, "
+            "cross-entropy, MSE, etc.) — NOT `output.mean()` which is meaningless."
+        )
+
+    if isinstance(training, dict) and training.get("gradient_checkpointing"):
+        hints.append(
+            "Memory optimization detected: enable `model.enable_gradient_checkpointing()` and use "
+            "`torch.cuda.amp.autocast()` to reduce VRAM usage."
+        )
+
+    return hints
+
+
+def _constraints_section(ctx: CodegenContext) -> str:
+    seeds = _requested_seeds(ctx)
+    return (
+        "# Constraints\n"
+        " - Each experimental condition must implement a genuinely DIFFERENT algorithm\n"
+        " - Metrics must be computed from actual model outputs — NEVER hardcode values\n"
+        " - Save project-appropriate artifacts to `outputs/` directory based on the task modality and plan "
+        "(e.g. PNG/JPG for images, MP4/GIF or representative frames for video, WAV for audio, plots/tables for analysis)\n"
+        f" - Use exactly {len(seeds)} random seeds ({', '.join(map(str, seeds))}) for each condition\n"
+        " - Print results in format: `{metric}: <value>` for pipeline parsing\n"
+        " - Support both full mode (`python main.py`) and lightweight smoke mode (`SMOKE_TEST=1 python main.py`)\n"
+        " - Smoke mode may only shrink counts; it must not change algorithms, conditions, or metric semantics\n"
+        " - NO try/except blocks (except in save_outputs for file I/O)\n"
+        " - Code must complete within the time budget"
+    ).replace("{metric}", ctx.metric)

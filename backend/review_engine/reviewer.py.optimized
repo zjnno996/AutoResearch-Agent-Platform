@@ -1,0 +1,1526 @@
+"""Review orchestration — single-dim, batch, hybrid, multi-model, streaming."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import statistics
+import time
+import urllib.request
+import urllib.error
+import uuid
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from queue import Queue
+from threading import Thread, Lock
+from typing import Any
+
+from .dimensions import (
+    BATCH_SYSTEM_PROMPT,
+    DIMENSION_GROUPS,
+    DIMENSION_SECTION_MAP,
+    DIMENSION_TO_GROUP,
+    FACT_EXTRACTION_PROMPT,
+    MAX_FILE_SIZE_BYTES,
+    MAX_TEXT_LENGTH,
+    OVERALL_SUMMARY_SYSTEM_PROMPT,
+    REVIEW_DIMENSIONS,
+    REVIEW_SYSTEM_PROMPT,
+    VISION_MODELS,
+    dim_by_id,
+)
+from .llm_client import get_client_for_model, get_primary_model_name
+from .pdf_utils import (
+    _build_dimension_text,
+    _build_group_text,
+    _check_extraction_quality,
+    _estimate_token_usage,
+    _get_paper_images,
+    _get_paper_text,
+    _vision_extract_paper,
+)
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+HISTORY_DIR = ROOT_DIR / "backend" / "review_history"
+
+# =============================================================================
+# Few-shot / RAG
+# =============================================================================
+
+_RAG_ENGINE = None
+
+
+def _get_rag_engine():
+    global _RAG_ENGINE
+    if _RAG_ENGINE is None:
+        try:
+            from review_data.rag_engine import get_rag_engine
+            _RAG_ENGINE = get_rag_engine(rebuild=False)
+        except Exception:
+            _RAG_ENGINE = "error"
+    return _RAG_ENGINE if _RAG_ENGINE != "error" else None
+
+
+def _build_fewshot_context(
+    paper_text: str,
+    dim_id: str | None = None,
+    k: int = 2,
+    score_anchoring: bool = False,
+) -> str:
+    """Build few-shot example string using RAG retrieval.
+
+    When score_anchoring=True, retrieves more examples and selects across
+    score bands (high/medium/low) to calibrate the model's scoring.
+    """
+    engine = _get_rag_engine()
+    if not engine:
+        return ""
+
+    query_text = paper_text[:3000]
+
+    if score_anchoring:
+        # Retrieve enough examples to span score bands
+        try:
+            examples = engine.retrieve(query_text, dim_id=dim_id, k=6)
+        except Exception:
+            examples = []
+        if not examples:
+            return ""
+
+        # Select across bands
+        high = [e for e in examples
+                if e.overall_score is not None and e.overall_score >= 8]
+        mid = [e for e in examples
+               if e.overall_score is not None and 4 <= e.overall_score < 8]
+        low = [e for e in examples
+               if e.overall_score is not None and e.overall_score < 4]
+
+        selected = (high[:2] + mid[:1] + low[:1])
+        if not selected:
+            selected = examples[:4]
+
+        prefix = (
+            "Below are reference review examples at DIFFERENT SCORE LEVELS. "
+            "Use them as calibration: notice how high-scoring reviews discuss specific "
+            "evidence and nuance, while low-scoring ones highlight critical flaws. "
+            "Your scores should reflect a similar standard."
+        )
+    else:
+        try:
+            examples = engine.retrieve(query_text, dim_id=dim_id, k=k)
+        except Exception:
+            return ""
+        if not examples:
+            return ""
+        selected = examples[:k]
+        prefix = (
+            "Below are reference review examples. "
+            "Use them as quality calibration for the level of specificity and "
+            "evidence anchoring expected."
+        )
+
+    parts = []
+    for i, ex in enumerate(selected[:4]):
+        score_str = f"SCORE: {ex.overall_score}/10" if ex.overall_score is not None else ""
+        block = json.dumps({
+            "score": int(ex.overall_score * 10) if ex.overall_score else 70,
+            "summary": (ex.comment_to_author or "")[:200],
+            "strengths": ex.strengths[:3],
+            "weaknesses": ex.weaknesses[:3],
+            "suggestions": ex.suggestions[:3],
+        }, ensure_ascii=False)
+        tag = f"// Reference example {i+1} (dimension: {dim_id}) {score_str}:"
+        if score_anchoring:
+            band = ""
+            if ex.overall_score is not None:
+                if ex.overall_score >= 8:
+                    band = " [HIGH SCORE ANCHOR]"
+                elif ex.overall_score >= 4:
+                    band = " [MEDIUM SCORE ANCHOR]"
+                else:
+                    band = " [LOW SCORE ANCHOR]"
+            tag = f"// Reference example {i+1} (dimension: {dim_id}) {score_str}{band}:"
+        parts.append(f"{tag}\n{block}")
+
+    if not parts:
+        return ""
+
+    return "\n\n".join([prefix] + parts)
+
+
+# =============================================================================
+# Citation-aware context
+# =============================================================================
+
+ARXIV_PATTERN = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d+(?:v\d+)?)", re.IGNORECASE)
+DOI_PATTERN = re.compile(r"(?:doi\.org/|doi:\s*)(10\.\d{4,}/[^\s,;)]+)", re.IGNORECASE)
+
+
+def _extract_references(paper_text: str) -> list[dict[str, str]]:
+    """Extract arXiv IDs and DOIs from paper text."""
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in ARXIV_PATTERN.finditer(paper_text):
+        arxiv_id = match.group(1)
+        if arxiv_id not in seen:
+            seen.add(arxiv_id)
+            refs.append({"type": "arxiv", "id": arxiv_id})
+    for match in DOI_PATTERN.finditer(paper_text):
+        doi = match.group(1).rstrip(".,)")
+        if doi not in seen:
+            seen.add(doi)
+            refs.append({"type": "doi", "id": doi})
+    return refs[:10]
+
+
+def _fetch_reference_context(paper_text: str) -> str:
+    """Fetch abstracts for cited references."""
+    refs = _extract_references(paper_text)
+    if not refs:
+        return ""
+
+    contexts: list[str] = []
+    for ref in refs:
+        try:
+            if ref["type"] == "arxiv":
+                url = f"https://export.arxiv.org/api/query?id_list={ref['id']}"
+                req = urllib.request.Request(url, headers={"User-Agent": "ClawAI/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    xml_data = resp.read().decode("utf-8")
+                    root = ET.fromstring(xml_data)
+                    ns = {"atom": "http://www.w3.org/2005/Atom",
+                          "arxiv": "http://arxiv.org/schemas/atom"}
+                    title_el = root.find(".//atom:title", ns)
+                    abstract_el = root.find(".//atom:summary", ns)
+                    title = title_el.text.strip() if title_el is not None and title_el.text else ""
+                    abstract = abstract_el.text.strip() if abstract_el is not None and abstract_el.text else ""
+                    if title and abstract:
+                        abstract_clean = re.sub(r"\s+", " ", abstract)[:500]
+                        contexts.append(f"[{ref['id']}] {title}: {abstract_clean}")
+            elif ref["type"] == "doi":
+                url = f"https://api.crossref.org/works/{ref['id']}"
+                req = urllib.request.Request(url, headers={"User-Agent": "ClawAI/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    msg = data.get("message", {})
+                    title = (msg.get("title") or [""])[0]
+                    abstract = (msg.get("abstract") or "")[:500]
+                    if title:
+                        abstract_clean = re.sub(r"\s+", " ", abstract) if abstract else "(no abstract)"
+                        contexts.append(f"[DOI:{ref['id']}] {title}: {abstract_clean}")
+        except Exception:
+            continue
+
+    if not contexts:
+        return ""
+    return "Referenced works (for verifying related work claims):\n" + "\n".join(contexts)
+
+
+# =============================================================================
+# Dimension review with retry
+# =============================================================================
+
+def _run_review_dimension(
+    client: Any, paper_text: str, dimension: dict[str, str], model: str | None,
+    page_images: list[str] | None = None,
+    facts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run a single dimension review against the LLM with retry."""
+    has_images = page_images and any(page_images)
+    role_instruction = dimension.get("role", "")
+    system_msg = REVIEW_SYSTEM_PROMPT
+    if role_instruction:
+        system_msg = role_instruction + "\n\n" + REVIEW_SYSTEM_PROMPT
+
+    try:
+        fewshot_ctx = _build_fewshot_context(paper_text, dimension["id"], score_anchoring=True)
+        if fewshot_ctx:
+            system_msg += "\n\n" + fewshot_ctx
+    except Exception:
+        pass
+
+    # Build facts section if available
+    facts_section = ""
+    if facts:
+        parts = []
+        if facts.get("research_question"):
+            parts.append(f"Research Question: {facts['research_question']}")
+        if facts.get("claim"):
+            parts.append(f"Main Claim: {facts['claim']}")
+        if facts.get("method_summary"):
+            parts.append(f"Method: {facts['method_summary']}")
+        if facts.get("datasets"):
+            parts.append(f"Datasets: {'; '.join(facts['datasets'])}")
+        if facts.get("baselines"):
+            parts.append(f"Baselines: {'; '.join(facts['baselines'])}")
+        if facts.get("key_results"):
+            kr_lines = []
+            for kr in facts["key_results"]:
+                kr_lines.append(f"  - {kr.get('claim','')} ({kr.get('section','')}): {kr.get('evidence','')}")
+            parts.append(f"Key Results:\n" + "\n".join(kr_lines))
+        if parts:
+            facts_section = (
+                "\n\n## Extracted Facts (ground truth — verify every claim against these)\n"
+                + "\n".join(parts)
+            )
+
+    if has_images:
+        img_prompt = (
+            f"## Paper Content\n\n{_build_dimension_text(paper_text, dimension['id'], max_chars=30000)}"
+            f"{facts_section}\n\n"
+            f"## Review Task: {dimension['label']}\n\n{dimension['prompt']}\n\n"
+            "The paper pages are attached as images. Use both the extracted text "
+            "and the page images (especially figures, tables, charts) for your evaluation. "
+            "Respond with valid JSON following the schema provided in the system prompt."
+        )
+        content_parts: list[dict[str, Any]] = [
+            {"type": "text", "text": img_prompt}
+        ]
+        for img_b64 in page_images:
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+            })
+        user_content = content_parts
+    else:
+        dim_text = _build_dimension_text(paper_text, dimension["id"])
+        user_content = (
+            f"## Paper Content\n\n{dim_text}"
+            f"{facts_section}\n\n"
+            f"## Review Task: {dimension['label']}\n\n{dimension['prompt']}\n\n"
+            "Respond with valid JSON following the schema provided in the system prompt."
+        )
+
+    last_error = ""
+    token_usage: dict[str, int] = {"prompt": 0, "completion": 0, "total": 0}
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            resp = client.chat(
+                messages=[{"role": "user", "content": user_content}],
+                system=system_msg,
+                model=model if model else None,
+                max_tokens=4096,
+                temperature=0.3,
+                json_mode=True,
+            )
+            token_usage = {
+                "prompt": getattr(resp, "prompt_tokens", 0),
+                "completion": getattr(resp, "completion_tokens", 0),
+                "total": getattr(resp, "total_tokens", 0),
+            }
+            result = json.loads(resp.content)
+            return {
+                "dimensionId": dimension["id"],
+                "score": max(0, min(100, int(result.get("score", 70)))),
+                "summary": str(result.get("summary", ""))[:500],
+                "strengths": [str(s)[:200] for s in (result.get("strengths") or [])][:3],
+                "weaknesses": [str(w)[:200] for w in (result.get("weaknesses") or [])][:3],
+                "suggestions": [str(s)[:200] for s in (result.get("suggestions") or [])][:3],
+                "analysis": str(result.get("analysis", ""))[:1000],
+                "self_critique": str(result.get("self_critique", ""))[:500],
+                "_token_usage": token_usage,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < max_attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+
+    return {
+        "dimensionId": dimension["id"],
+        "score": 50,
+        "summary": f"Review failed after {max_attempts} attempts: {last_error}",
+        "strengths": ["Unable to complete review"],
+        "weaknesses": ["Review process encountered an error"],
+        "suggestions": ["Try again with a different model or paper format"],
+        "analysis": "",
+        "self_critique": "",
+        "_token_usage": token_usage,
+    }
+
+
+# =============================================================================
+# Batch single-call review
+# =============================================================================
+
+def _run_review_batch(
+    client: Any,
+    paper_text: str,
+    dimensions: list[dict[str, str]],
+    model: str | None = None,
+    reference_context: str = "",
+    facts: dict[str, Any] | None = None,
+    skeptic_questions: list[str] | None = None,
+    venue: str = "",
+) -> list[dict[str, Any]]:
+    """Run ALL dimension reviews in a single LLM call.
+
+    Args:
+        client: LLM client
+        paper_text: Extracted paper text
+        dimensions: Dimensions to evaluate
+        model: Model name override
+        reference_context: Context from referenced works
+        facts: Extracted paper facts for evidence grounding
+        skeptic_questions: Probing questions about assumptions/gaps
+        venue: Conference venue (e.g. "ICLR", "NeurIPS") for standards calibration
+    """
+    dim_sections = "\n\n".join(
+        f"### Dimension: {d['label']} (id: {d['id']})\n{d.get('role', '')}\n{d['prompt']}"
+        for d in dimensions
+    )
+
+    ref_section = ""
+    if reference_context:
+        ref_section = f"\n\n## Reference Context\n\n{reference_context[:5000]}"
+
+    facts_section = ""
+    if facts:
+        parts = []
+        if facts.get("research_question"):
+            parts.append(f"Research Question: {facts['research_question']}")
+        if facts.get("claim"):
+            parts.append(f"Main Claim: {facts['claim']}")
+        if facts.get("method_summary"):
+            parts.append(f"Method: {facts['method_summary']}")
+        if facts.get("datasets"):
+            parts.append(f"Datasets: {'; '.join(facts['datasets'])}")
+        if facts.get("baselines"):
+            parts.append(f"Baselines: {'; '.join(facts['baselines'])}")
+        if facts.get("key_results"):
+            kr_lines = []
+            for kr in facts["key_results"]:
+                kr_lines.append(f"  - {kr.get('claim','')} ({kr.get('section','')}): {kr.get('evidence','')}")
+            parts.append(f"Key Results:\n" + "\n".join(kr_lines))
+        if parts:
+            facts_section = (
+                "\n\n## Extracted Facts (ground truth — verify every claim against these)\n"
+                + "\n".join(parts)
+            )
+
+    # Add skeptic questions section
+    skeptic_section = ""
+    if skeptic_questions:
+        q_lines = "\n".join(f"  Q{j+1}: {q}" for j, q in enumerate(skeptic_questions))
+        skeptic_section = (
+            "\n\n## Critical Questions to Address\n"
+            "A pre-review analysis identified these potential concerns. "
+            "Your review MUST address each of these questions explicitly "
+            "(say whether each concern is valid or explain why it does not apply):\n"
+            f"{q_lines}"
+        )
+
+    # Add venue standards
+    venue_section = ""
+    if venue:
+        venue_lower = venue.lower()
+        if "iclr" in venue_lower:
+            venue_section = (
+                "\n\n## Venue Standards (ICLR)\n"
+                "ICLR is a top-tier conference that emphasizes:\n"
+                "- **Novelty**: Contributions must be more than incremental. "
+                "Strong theoretical insights or surprisingly effective empirical results are expected.\n"
+                "- **Completeness**: Papers are expected to be self-contained with thorough experiments.\n"
+                "- **Reproducibility**: Code release is expected where feasible.\n"
+                "Score calibration: 8+ = strong ICLR paper, 6-7 = decent but below ICLR bar, <6 = reject."
+            )
+        elif "neurips" in venue_lower:
+            venue_section = (
+                "\n\n## Venue Standards (NeurIPS)\n"
+                "NeurIPS emphasizes:\n"
+                "- **Technical rigor**: Sound methodology, statistical significance.\n"
+                "- **Scope**: Broad interest to the ML community.\n"
+                "- **Reproducibility**: Strong expectations for experimental detail.\n"
+                "Score calibration: 8+ = strong NeurIPS paper, 6-7 = acceptable, <6 = reject."
+            )
+
+    group_text = _build_group_text(paper_text, [d["id"] for d in dimensions], max_chars=50000)
+    user_content = (
+        f"## Paper Content\n\n{group_text}{ref_section}{facts_section}{skeptic_section}{venue_section}\n\n"
+        f"## Evaluation Dimensions\n\n{len(dimensions)} dimensions to evaluate:\n\n"
+        f"{dim_sections}\n\n"
+        "Output valid JSON with one key per dimension id. "
+        "Each value must have: score (0-100), summary (string), "
+        "strengths (array of 3), weaknesses (array of 3), suggestions (array of 3).\n"
+        "Be critical and specific, referencing content from the paper."
+    )
+
+    roles = [d.get("role", "") for d in dimensions if d.get("role")]
+    batch_system = BATCH_SYSTEM_PROMPT
+    if roles:
+        role_header = "You are serving as multiple expert reviewers:\n" + "\n".join(f"- {r}" for r in roles)
+        batch_system = role_header + "\n\n" + BATCH_SYSTEM_PROMPT
+
+    try:
+        dim_fewshots = []
+        for d in dimensions:
+            ctx = _build_fewshot_context(paper_text, d["id"], score_anchoring=True)
+            if ctx:
+                dim_fewshots.append(f"[{d['label']}]\n{ctx}")
+        if dim_fewshots:
+            batch_system += "\n\n" + "=" * 40 + "\nReference Review Examples (Score-Anchored)\n" + "=" * 40 + "\n"
+            batch_system += "\n\n".join(dim_fewshots)
+    except Exception:
+        pass
+
+    token_usage: dict[str, int] = {"prompt": 0, "completion": 0, "total": 0}
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            resp = client.chat(
+                messages=[{"role": "user", "content": user_content}],
+                system=batch_system,
+                model=model if model else None,
+                max_tokens=8192,
+                temperature=0.3,
+                json_mode=True,
+            )
+
+            token_usage = {
+                "prompt": getattr(resp, "prompt_tokens", 0),
+                "completion": getattr(resp, "completion_tokens", 0),
+                "total": getattr(resp, "total_tokens", 0),
+            }
+
+            raw = resp.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1]
+                raw = raw.rsplit("```", 1)[0]
+            data = json.loads(raw)
+
+            results: list[dict[str, Any]] = []
+            for dim in dimensions:
+                dim_id = dim["id"]
+                entry = data.get(dim_id, {})
+                results.append({
+                    "dimensionId": dim_id,
+                    "score": max(0, min(100, int(entry.get("score", 70)))),
+                    "summary": str(entry.get("summary", ""))[:500],
+                    "strengths": [str(s)[:200] for s in (entry.get("strengths") or [])][:3],
+                    "weaknesses": [str(w)[:200] for w in (entry.get("weaknesses") or [])][:3],
+                    "suggestions": [str(s)[:200] for s in (entry.get("suggestions") or [])][:3],
+                    "analysis": str(entry.get("analysis", ""))[:1000],
+                    "self_critique": str(entry.get("self_critique", ""))[:500],
+                    "_token_usage": token_usage,
+                })
+            return results
+        except Exception as exc:
+            if attempt < max_attempts - 1:
+                time.sleep(2.0)
+                continue
+            return [
+                {
+                    "dimensionId": dim["id"],
+                    "score": 50,
+                    "summary": f"Batch review failed: {exc}",
+                    "strengths": ["Unable to complete review"],
+                    "weaknesses": ["Review process encountered an error"],
+                    "suggestions": ["Try again with a different model or paper format"],
+                    "analysis": "",
+                    "self_critique": "",
+                    "_token_usage": token_usage,
+                }
+                for dim in dimensions
+            ]
+
+
+# =============================================================================
+# Hybrid group scheduling: 3+2+2
+# =============================================================================
+
+def _run_review_hybrid(
+    client: Any,
+    paper_text: str,
+    dimensions: list[dict[str, str]],
+    model: str | None = None,
+    reference_context: str = "",
+    facts: dict[str, Any] | None = None,
+    skeptic_questions: list[str] | None = None,
+    venue: str = "",
+) -> list[dict[str, Any]]:
+    """Run dimension reviews in 3 parallel groups (3+2+2)."""
+    groups: dict[int, list[dict[str, str]]] = {}
+    for dim in dimensions:
+        gidx = DIMENSION_TO_GROUP.get(dim["id"], 0)
+        groups.setdefault(gidx, []).append(dim)
+
+    results_by_dim: dict[str, dict[str, Any]] = {}
+    lock = Lock()
+
+    def run_group(group_dims: list[dict[str, str]]) -> None:
+        if not group_dims:
+            return
+        g_results = _run_review_batch(
+            client, paper_text, group_dims, model, reference_context,
+            facts=facts, skeptic_questions=skeptic_questions, venue=venue,
+        )
+        with lock:
+            for r in g_results:
+                results_by_dim[r["dimensionId"]] = r
+
+    group_list = list(groups.values())
+    if len(group_list) <= 1:
+        for g in group_list:
+            run_group(g)
+    else:
+        with ThreadPoolExecutor(max_workers=len(group_list)) as pool:
+            pool.map(run_group, group_list)
+
+    return [results_by_dim[dim["id"]] for dim in dimensions if dim["id"] in results_by_dim]
+
+
+# =============================================================================
+# Multi-model voting
+# =============================================================================
+
+def _run_review_multi_model(
+    paper_text: str,
+    dimensions: list[dict[str, str]],
+    models: list[str],
+    reference_context: str = "",
+    facts: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Run review with multiple models and average the results."""
+    all_results: dict[str, list[dict[str, Any]]] = {}
+
+    for model_name in models:
+        try:
+            client = get_client_for_model(model_name)
+            model_results = _run_review_batch(client, paper_text, dimensions, model_name, reference_context, facts=facts)
+            for r in model_results:
+                all_results.setdefault(r["dimensionId"], []).append(r)
+        except Exception:
+            continue
+
+    if not all_results:
+        return [
+            {
+                "dimensionId": dim["id"],
+                "score": 50,
+                "summary": "All models failed",
+                "strengths": [],
+                "weaknesses": ["No models could complete the review"],
+                "suggestions": ["Check model availability"],
+            }
+            for dim in dimensions
+        ]
+
+    merged: list[dict[str, Any]] = []
+    for dim in dimensions:
+        dim_id = dim["id"]
+        entries = all_results.get(dim_id, [])
+        if not entries:
+            merged.append({
+                "dimensionId": dim_id,
+                "score": 50,
+                "summary": "No results from any model",
+                "strengths": [],
+                "weaknesses": ["Models failed for this dimension"],
+                "suggestions": ["Retry with different models"],
+            })
+            continue
+
+        scores = [e["score"] for e in entries]
+        avg_score = round(statistics.mean(scores))
+        stddev = round(statistics.stdev(scores), 1) if len(scores) > 1 else 0
+
+        sorted_by_score = sorted(entries, key=lambda e: abs(e["score"] - avg_score))
+        median_entry = sorted_by_score[0]
+
+        merged.append({
+            "dimensionId": dim_id,
+            "score": max(0, min(100, avg_score)),
+            "summary": median_entry["summary"],
+            "strengths": median_entry["strengths"],
+            "weaknesses": median_entry["weaknesses"],
+            "suggestions": median_entry["suggestions"],
+            "confidence": {
+                "stddev": stddev,
+                "disagreement": stddev > 10,
+                "model_scores": {
+                    models[i] if i < len(models) else f"model_{i}": scores[i]
+                    for i in range(len(scores))
+                },
+                "num_models": len(scores),
+            },
+        })
+
+    return merged
+
+
+# =============================================================================
+# Per-dimension parallel review
+# =============================================================================
+
+class ReviewProgress:
+    """Tracks and emits per-dimension progress for streaming."""
+
+    def __init__(self, dims_to_run: list[dict[str, str]]):
+        self.dims_to_run = dims_to_run
+        self.total = len(dims_to_run)
+        self.completed: list[dict[str, Any]] = []
+        self._lock = Lock()
+
+    def add_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.completed.append(result)
+        return {
+            "type": "progress",
+            "dimensionId": result["dimensionId"],
+            "result": result,
+            "completed": len(self.completed),
+            "total": self.total,
+        }
+
+    def get_complete_event(self) -> dict[str, Any]:
+        results = self.completed
+        overall = sum(r["score"] for r in results) // len(results) if results else 0
+        return {
+            "type": "complete",
+            "overallScore": overall,
+            "dimensionCount": len(results),
+            "results": results,
+        }
+
+
+def _run_review_parallel(
+    client: Any,
+    review_text: str,
+    dims_to_run: list[dict[str, str]],
+    model: str | None = None,
+    page_images: list[str] | None = None,
+    progress_queue: Queue | None = None,
+    facts: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Run per-dimension parallel reviews."""
+    results: list[dict[str, Any]] = []
+    progress = ReviewProgress(dims_to_run)
+
+    with ThreadPoolExecutor(max_workers=len(dims_to_run)) as pool:
+        futures = {
+            pool.submit(_run_review_dimension, client, review_text, dim, model, page_images, facts=facts): dim
+            for dim in dims_to_run
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            if progress_queue:
+                event = progress.add_result(result)
+                progress_queue.put(event)
+
+    return results
+
+
+# =============================================================================
+# Review quality check
+# =============================================================================
+
+def _check_review_consistency(result: dict[str, Any]) -> dict[str, Any]:
+    """Verify review internal consistency: score vs text coherence.
+    Returns the review result with added quality flags."""
+    score = result.get("score", 50)
+    strengths = result.get("strengths", [])
+    weaknesses = result.get("weaknesses", [])
+
+    # Check if score is high but weaknesses are overly harsh > strengths
+    # or score is low but all strengths > weaknesses
+    flags = []
+
+    if score >= 80 and len(weaknesses) >= 3:
+        avg_w_len = sum(len(w) for w in weaknesses) / len(weaknesses)
+        avg_s_len = sum(len(s) for s in strengths) / max(len(strengths), 1)
+        if avg_w_len > avg_s_len * 2:
+            flags.append("score-text-mismatch: high score but verbose weaknesses")
+
+    if score <= 40 and len(strengths) >= 3:
+        avg_s_len = sum(len(s) for s in strengths) / len(strengths)
+        avg_w_len = sum(len(w) for w in weaknesses) / max(len(weaknesses), 1)
+        if avg_s_len > avg_w_len * 2:
+            flags.append("score-text-mismatch: low score but verbose strengths")
+
+    # Check for placeholder text
+    for item in strengths + weaknesses:
+        if "unable to" in item.lower() or "review process" in item.lower():
+            flags.append("review-failed-placeholder")
+            break
+
+    result["_quality_flags"] = flags
+    return result
+
+
+# =============================================================================
+# Overall executive summary
+# =============================================================================
+
+
+def _generate_overall_summary(
+    results: list[dict[str, Any]],
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    """Generate an overall executive summary from all dimension reviews.
+    Returns None if generation fails (non-blocking).
+    """
+    if not results:
+        return None
+
+    try:
+        client = get_client_for_model(model or get_primary_model_name())
+    except Exception:
+        return None
+
+    scores = [r["score"] for r in results if "score" in r]
+    avg = sum(scores) // len(scores) if scores else 0
+    max_d = max(scores) if scores else 0
+    min_d = min(scores) if scores else 0
+
+    dim_summaries = []
+    for r in results:
+        dim_summaries.append(
+            f"=== {r.get('dimensionId', '?')} ===\n"
+            f"Score: {r.get('score', '?')}/100\n"
+            f"Summary: {r.get('summary', '')[:300]}\n"
+            f"Strengths: {'; '.join(r.get('strengths', []) or [])}\n"
+            f"Weaknesses: {'; '.join(r.get('weaknesses', []) or [])}\n"
+            f"Suggestions: {'; '.join(r.get('suggestions', []) or [])}\n"
+        )
+
+    context = (
+        f"Review scores across {len(results)} dimensions.\n"
+        f"Average: {avg}/100 | Range: {min_d}–{max_d}\n\n"
+        + "\n".join(dim_summaries)
+    )
+
+    try:
+        resp = client.chat(
+            messages=[{"role": "user", "content": context}],
+            system=OVERALL_SUMMARY_SYSTEM_PROMPT,
+            model=model if model else None,
+            max_tokens=2048,
+            temperature=0.2,
+            json_mode=True,
+        )
+        summary_tokens = {
+            "prompt": getattr(resp, "prompt_tokens", 0),
+            "completion": getattr(resp, "completion_tokens", 0),
+        }
+        summary = json.loads(resp.content)
+        return {
+            "overallAssessment": str(summary.get("overallAssessment", ""))[:600],
+            "recommendation": str(summary.get("recommendation", "borderline")),
+            "topStrengths": [str(s)[:200] for s in (summary.get("topStrengths") or [])][:3],
+            "topWeaknesses": [str(w)[:200] for w in (summary.get("topWeaknesses") or [])][:3],
+            "keySuggestions": [str(s)[:200] for s in (summary.get("keySuggestions") or [])][:3],
+            "confidence": str(summary.get("confidence", "medium")),
+            "averageScore": avg,
+            "scoreRange": f"{min_d}–{max_d}",
+            "_token_usage": summary_tokens,
+        }
+    except Exception:
+        return None
+
+
+# =============================================================================
+# Stage 1: Structured fact extraction
+# =============================================================================
+
+
+def _extract_paper_facts(
+    paper_text: str,
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    """Extract structured facts from paper text.
+
+    Returns a dict with research_question, claim, method_summary, datasets,
+    baselines, key_results, limitations — or None on failure.
+    """
+    if not paper_text or len(paper_text.strip()) < 200:
+        return None
+
+    try:
+        client = get_client_for_model(model or get_primary_model_name())
+    except Exception:
+        return None
+
+    try:
+        resp = client.chat(
+            messages=[{"role": "user", "content": paper_text[:25000]}],
+            system=FACT_EXTRACTION_PROMPT,
+            model=model if model else None,
+            max_tokens=4096,
+            temperature=0.1,
+            json_mode=True,
+        )
+        raw = json.loads(resp.content)
+        facts = {
+            "research_question": str(raw.get("research_question", ""))[:500],
+            "claim": str(raw.get("claim", ""))[:500],
+            "method_summary": str(raw.get("method_summary", ""))[:1000],
+            "datasets": [str(d)[:200] for d in (raw.get("datasets") or [])][:5],
+            "baselines": [str(b)[:200] for b in (raw.get("baselines") or [])][:5],
+            "key_results": [
+                {
+                    "claim": str(kr.get("claim", ""))[:300],
+                    "evidence": str(kr.get("evidence", ""))[:300],
+                    "section": str(kr.get("section", ""))[:100],
+                }
+                for kr in (raw.get("key_results") or [])
+            ][:5],
+            "limitations": [str(l)[:300] for l in (raw.get("limitations") or [])][:3],
+        }
+        return facts
+    except Exception:
+        return None
+
+
+# =============================================================================
+# Stage 2: Skeptic question generation (assumption probing)
+# =============================================================================
+
+SKEPTIC_PROMPT = (
+    "You are a devil's advocate reviewer analyzing a research paper. "
+    "Your job is to generate probing questions that identify hidden assumptions, "
+    "unstated premises, alternative explanations, and methodological gaps.\n\n"
+    "Based on the paper facts and text below, generate 5-8 specific questions "
+    "a critical reviewer would ask about THIS specific paper — not generic questions.\n\n"
+    "For each question, cite the specific section or claim it targets.\n\n"
+    "Output a JSON array of strings only.\n"
+    'Example: ["In §3.2, the paper assumes X without justification — what if X does not hold in practice?", '
+    '"The claim that Y outperforms Z (Table 2) uses default Z hyperparameters — would proper tuning change the ranking?"]\n\n'
+    "Paper facts:\n{facts_str}\n\nPaper excerpt:\n{paper_excerpt}"
+)
+
+
+def _generate_skeptic_questions(
+    paper_text: str,
+    facts: dict[str, Any] | None = None,
+    model: str | None = None,
+) -> list[str]:
+    """Generate probing questions about the paper's assumptions and gaps."""
+    if not paper_text or len(paper_text.strip()) < 200:
+        return []
+
+    facts_str = ""
+    if facts:
+        parts = []
+        if facts.get("claim"):
+            parts.append(f"Main claim: {facts['claim']}")
+        if facts.get("method_summary"):
+            parts.append(f"Method: {facts['method_summary']}")
+        if facts.get("key_results"):
+            for kr in facts["key_results"]:
+                parts.append(f"Result: {kr.get('claim','')} ({kr.get('section','')}) → {kr.get('evidence','')}")
+        if facts.get("limitations"):
+            parts.append(f"Stated limitations: {'; '.join(facts['limitations'])}")
+        if facts.get("baselines"):
+            parts.append(f"Baselines: {'; '.join(facts['baselines'])}")
+        facts_str = "\n".join(parts)
+    else:
+        facts_str = "(no facts extracted)"
+
+    paper_excerpt = paper_text[:4000]
+
+    prompt = SKEPTIC_PROMPT.format(facts_str=facts_str, paper_excerpt=paper_excerpt)
+
+    try:
+        client = get_client_for_model(model or get_primary_model_name())
+        resp = client.chat(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.3,
+            json_mode=True,
+        )
+        raw = resp.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            raw = raw.rsplit("```", 1)[0]
+        questions = json.loads(raw)
+        if isinstance(questions, dict):
+            for v in questions.values():
+                if isinstance(v, list):
+                    questions = v
+                    break
+        if not isinstance(questions, list):
+            return []
+        return [str(q)[:300] for q in questions if isinstance(q, str)][:8]
+    except Exception:
+        return []
+
+
+# =============================================================================
+# Stage 3: Fact grounding verification
+# =============================================================================
+
+
+def _verify_fact_grounding(
+    result: dict[str, Any],
+    facts: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Lightweight check: flag strengths/weaknesses that may be ungrounded in facts.
+    Compares key terms in review items against terms from extracted facts.
+    Non-blocking — only appends to _grounding_issues.
+    """
+    if not facts:
+        return result
+
+    # Build a set of known significant terms from the facts
+    known_terms: set[str] = set()
+    for val in facts.values():
+        if isinstance(val, str):
+            known_terms.update(
+                w.lower() for w in val.split() if len(w) > 5
+            )
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str):
+                    known_terms.update(
+                        w.lower() for w in item.split() if len(w) > 5
+                    )
+                elif isinstance(item, dict):
+                    for sv in item.values():
+                        if isinstance(sv, str):
+                            known_terms.update(
+                                w.lower() for w in sv.split() if len(w) > 5
+                            )
+
+    if not known_terms:
+        return result
+
+    issues: list[str] = []
+    for key in ("strengths", "weaknesses"):
+        for item in (result.get(key) or []):
+            item_words = set(
+                w.lower() for w in item.split() if len(w) > 5
+            )
+            overlap = item_words & known_terms
+            if len(item_words) >= 3 and len(overlap) <= 1:
+                issues.append(
+                    f"possibly ungrounded: \"{item[:120]}\" — "
+                    f"only {len(overlap)}/{len(item_words)} key terms match extracted facts"
+                )
+
+    if issues:
+        result["_grounding_issues"] = result.get("_grounding_issues", []) + issues
+
+    return result
+
+
+# =============================================================================
+# Main review orchestration
+# =============================================================================
+
+def run_review(
+    file_base64: str,
+    file_name: str,
+    dimension_ids: list[str],
+    model: str | None = None,
+    progress_queue: Queue | None = None,
+    vision_reader: bool = False,
+    batch: bool = False,
+    hybrid: bool = True,
+    models: list[str] | None = None,
+    venue: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None]:
+    """Run a full multi-dimensional paper review.
+
+    Args:
+        venue: Conference venue (e.g. "ICLR", "NeurIPS") for standards calibration
+    """
+    if model in ("default", ""):
+        model = None
+
+    meta: dict[str, Any] = {}
+    paper_text = _get_paper_text(file_base64, file_name)
+    raw = b""
+    try:
+        raw = base64.b64decode(file_base64)
+    except Exception:
+        pass
+
+    target_model = model or get_primary_model_name()
+    is_review_vision = any(vm in target_model.lower() for vm in VISION_MODELS)
+
+    vision_extracted: str | None = None
+    vision_token_info: dict[str, int] = {}
+    should_use_vision = vision_reader and not is_review_vision and raw
+
+    if should_use_vision:
+        vision_extracted, vision_token_info = _vision_extract_paper(raw, file_name)
+
+    review_text = vision_extracted if vision_extracted else paper_text
+
+    quality = _check_extraction_quality(review_text, raw)
+    meta["text_quality"] = quality
+
+    reference_context = _fetch_reference_context(paper_text)
+    meta["references_found"] = bool(reference_context)
+    meta["references_count"] = len(_extract_references(paper_text))
+
+    page_images = _get_paper_images(file_base64, file_name) if (is_review_vision and not vision_extracted) else []
+
+    # Stage 1: Extract structured facts for evidence grounding
+    facts = _extract_paper_facts(review_text, model=model)
+    meta["facts_extracted"] = bool(facts)
+    meta["facts_count"] = len(facts.get("key_results", [])) if facts else 0
+
+    # Stage 1.5: Generate skeptic probing questions (assumption checking)
+    skeptic_questions = _generate_skeptic_questions(review_text, facts, model=model)
+    meta["skeptic_questions_generated"] = len(skeptic_questions)
+    if skeptic_questions:
+        meta["skeptic_questions"] = skeptic_questions
+
+    if not review_text.strip():
+        empty_results = [
+            {
+                "dimensionId": d["id"],
+                "score": 0,
+                "summary": "Could not extract text from the uploaded file." if not vision_extracted
+                           else "Vision extraction returned empty.",
+                "strengths": [],
+                "weaknesses": ["File appears to be empty or unreadable"],
+                "suggestions": ["Upload a clear PDF with selectable text"],
+            }
+            for d in REVIEW_DIMENSIONS
+            if not dimension_ids or d["id"] in dimension_ids
+        ]
+        if progress_queue:
+            for r in empty_results:
+                progress_queue.put({
+                    "type": "progress",
+                    "dimensionId": r["dimensionId"],
+                    "result": r,
+                    "completed": 0,
+                    "total": len(empty_results),
+                })
+        return empty_results, meta, None
+
+    dims_to_run = [
+        d for d in REVIEW_DIMENSIONS
+        if not dimension_ids or d["id"] in dimension_ids
+    ]
+
+    if models and len(models) > 1:
+        results = _run_review_multi_model(review_text, dims_to_run, models, reference_context, facts=facts)
+    elif hybrid:
+        client = get_client_for_model(model or get_primary_model_name())
+        results = _run_review_hybrid(
+            client, review_text, dims_to_run, model, reference_context,
+            facts=facts, skeptic_questions=skeptic_questions, venue=venue,
+        )
+    elif batch:
+        client = get_client_for_model(model or get_primary_model_name())
+        results = _run_review_batch(
+            client, review_text, dims_to_run, model, reference_context,
+            facts=facts, skeptic_questions=skeptic_questions, venue=venue,
+        )
+    else:
+        client = get_client_for_model(model)
+        results = _run_review_parallel(client, review_text, dims_to_run, model, page_images, progress_queue, facts=facts)
+
+    # Quality check each result
+    results = [_check_review_consistency(r) for r in results]
+
+    # Stage 3: Verify fact grounding in strengths/weaknesses
+    if facts:
+        results = [_verify_fact_grounding(r, facts) for r in results]
+        all_issues = sum(len(r.get("_grounding_issues", [])) for r in results)
+        meta["grounding_issues"] = all_issues
+
+    # Aggregate real token usage from all calls
+    total_prompt = 0
+    total_completion = 0
+    for r in results:
+        tu = r.get("_token_usage") or {}
+        total_prompt += tu.get("prompt", 0)
+        total_completion += tu.get("completion", 0)
+        r.pop("_token_usage", None)  # clean up internal field
+    meta["token_usage"] = {
+        "prompt_tokens": total_prompt,
+        "completion_tokens": total_completion,
+        "total_tokens": total_prompt + total_completion,
+    }
+
+    # Generate overall executive summary
+    summary_model = model or get_primary_model_name()
+    overall_summary = _generate_overall_summary(results, model=summary_model)
+
+    # Include summary token usage if available
+    if overall_summary and overall_summary.get("_token_usage"):
+        st = overall_summary["_token_usage"]
+        meta["token_usage"]["summary_prompt_tokens"] = st.get("prompt", 0)
+        meta["token_usage"]["summary_completion_tokens"] = st.get("completion", 0)
+        meta["token_usage"]["total_tokens"] += st.get("prompt", 0) + st.get("completion", 0)
+        overall_summary.pop("_token_usage", None)
+
+    is_group_or_batch = hybrid or batch
+    if progress_queue and results and is_group_or_batch:
+        total = len(results)
+        for i, r in enumerate(results):
+            progress_queue.put({
+                "type": "progress",
+                "dimensionId": r["dimensionId"],
+                "result": r,
+                "completed": i + 1,
+                "total": total,
+            })
+        if overall_summary:
+            progress_queue.put({
+                "type": "summary",
+                "summary": overall_summary,
+            })
+
+    text_path_len = len(paper_text) if paper_text else 0
+    vision_extract_len = len(vision_extracted) if vision_extracted else 0
+    vision_pages = vision_token_info.get("vision_pages_sent", 0)
+    review_mode = ("multi_model" if (models and len(models) > 1)
+                   else "hybrid" if hybrid else "batch" if batch else "parallel")
+
+    meta["token_estimate"] = _estimate_token_usage(
+        text_path_len=text_path_len,
+        vision_path_pages=vision_pages,
+        vision_path_extraction_len=vision_extract_len,
+        num_dims=len(dims_to_run),
+        review_mode=review_mode,
+    )
+    meta["vision_extracted"] = bool(vision_extracted)
+    meta["vision_pages"] = vision_pages
+    meta["review_mode"] = review_mode
+    meta["multi_model"] = bool(models and len(models) > 1)
+
+    return results, meta, overall_summary
+
+
+def run_review_streaming(
+    file_base64: str,
+    file_name: str,
+    dimension_ids: list[str],
+    model: str | None = None,
+    vision_reader: bool = False,
+    batch: bool = False,
+    hybrid: bool = True,
+    models: list[str] | None = None,
+) -> Queue:
+    """Run review with results streamed via a Queue."""
+    q: Queue = Queue()
+    dims_to_run = [
+        d for d in REVIEW_DIMENSIONS
+        if not dimension_ids or d["id"] in dimension_ids
+    ]
+    q.put({"type": "started", "total": len(dims_to_run)})
+
+    def _run():
+        try:
+            results, meta, overall_summary = run_review(
+                file_base64, file_name, dimension_ids, model,
+                progress_queue=q, vision_reader=vision_reader,
+                batch=batch, hybrid=hybrid, models=models,
+            )
+            overall = sum(r["score"] for r in results) // len(results) if results else 0
+            ev: dict[str, Any] = {
+                "type": "complete",
+                "overallScore": overall,
+                "dimensionCount": len(results),
+                "results": results,
+                "meta": meta,
+            }
+            if overall_summary:
+                ev["overallSummary"] = overall_summary
+            q.put(ev)
+        except Exception as exc:
+            q.put({"type": "error", "error": str(exc)})
+
+    Thread(target=_run, daemon=True).start()
+    return q
+
+
+# =============================================================================
+# Review history persistence
+# =============================================================================
+
+import math
+import re as _re
+from collections import Counter as _Counter
+
+_SEARCH_INDEX: dict[str, Any] | None = None
+
+
+def _tokenize(text: str) -> list[str]:
+    tokens = _re.findall(r"[a-z0-9]+(?:'[a-z]+)?", text.lower())
+    stopwords = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "dare", "ought",
+        "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "through", "during", "before", "after", "above", "below",
+        "between", "out", "off", "over", "under", "again", "further", "then",
+        "once", "here", "there", "when", "where", "why", "how", "all", "each",
+        "every", "both", "few", "more", "most", "other", "some", "such", "no",
+        "nor", "not", "only", "own", "same", "so", "than", "too", "very",
+        "just", "because", "but", "and", "or", "if", "while", "although",
+        "this", "that", "these", "those", "it", "its", "also", "well", "very",
+        "much", "many", "about", "which", "what", "who", "whom",
+    }
+    return [t for t in tokens if len(t) > 2 and t not in stopwords]
+
+
+def _build_search_index() -> dict[str, Any]:
+    """Build a lightweight TF-IDF search index over all review_history files."""
+    global _SEARCH_INDEX
+    if _SEARCH_INDEX is not None:
+        return _SEARCH_INDEX
+
+    _ensure_history_dir()
+    docs: list[dict[str, Any]] = []
+    doc_texts: list[str] = []
+
+    for fpath in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        # Build searchable text from all fields
+        parts = [data.get("fileName", "")]
+        for r in (data.get("results") or []):
+            parts.append(r.get("summary", ""))
+            parts.extend(r.get("strengths") or [])
+            parts.extend(r.get("weaknesses") or [])
+            parts.extend(r.get("suggestions") or [])
+        text = " ".join(p for p in parts if p)
+        docs.append({"id": data.get("id", fpath.stem), "data": data, "text": text})
+        doc_texts.append(text)
+
+    if not docs:
+        _SEARCH_INDEX = {"docs": [], "idf": {}, "tf_vectors": []}
+        return _SEARCH_INDEX
+
+    # Build TF-IDF vectors
+    tokenized = [_tokenize(t) for t in doc_texts]
+    n_docs = len(tokenized)
+    doc_freq: _Counter[str] = _Counter()
+    for tokens in tokenized:
+        for t in set(tokens):
+            doc_freq[t] += 1
+
+    idf: dict[str, float] = {}
+    for term, freq in doc_freq.items():
+        idf[term] = math.log((n_docs + 1) / (freq + 1)) + 1.0
+
+    # Compute TF vectors
+    tf_vectors: list[dict[str, float]] = []
+    for tokens in tokenized:
+        if not tokens:
+            tf_vectors.append({})
+            continue
+        tf: dict[str, float] = {}
+        for t in tokens:
+            tf[t] = 1.0 + math.log(tokens.count(t))
+        tf_vectors.append(tf)
+
+    _SEARCH_INDEX = {"docs": docs, "idf": idf, "tf_vectors": tf_vectors}
+    return _SEARCH_INDEX
+
+
+def _cosine_sim(v1: dict[str, float], v2: dict[str, float]) -> float:
+    dot = 0.0
+    for k, v in v1.items():
+        if k in v2:
+            dot += v * v2[k]
+    return dot
+
+
+def _normalize(v: dict[str, float]) -> dict[str, float]:
+    norm = math.sqrt(sum(x * x for x in v.values()))
+    if norm == 0:
+        return v
+    return {k: x / norm for k, x in v.items()}
+
+def _ensure_history_dir() -> Path:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    return HISTORY_DIR
+
+
+def _review_history_path(review_id: str) -> Path:
+    return _ensure_history_dir() / f"{review_id}.json"
+
+
+def save_review(
+    file_name: str, model: str | None, dimensions: list[str],
+    results: list[dict[str, Any]], meta: dict[str, Any] | None = None,
+    overall_summary: dict[str, Any] | None = None,
+) -> str:
+    """Save review results and return the review ID."""
+    review_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        + "_" + uuid.uuid4().hex[:8]
+    )
+    overall = sum(r["score"] for r in results) // len(results) if results else 0
+    record = {
+        "id": review_id,
+        "fileName": file_name,
+        "model": model or get_primary_model_name(),
+        "dimensions": dimensions,
+        "overallScore": overall,
+        "dimensionCount": len(results),
+        "results": results,
+        "meta": meta or {},
+        "overallSummary": overall_summary,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    path = _review_history_path(review_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+    return review_id
+
+
+def load_review_history() -> list[dict[str, Any]]:
+    """Load all saved review history records (summary only)."""
+    _ensure_history_dir()
+    records = []
+    for fpath in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                data = json.load(f)
+            records.append({
+                "id": data.get("id", fpath.stem),
+                "fileName": data.get("fileName", "Unknown"),
+                "model": data.get("model", ""),
+                "overallScore": data.get("overallScore", 0),
+                "dimensionCount": data.get("dimensionCount", 0),
+                "timestamp": data.get("timestamp", ""),
+            })
+        except Exception:
+            pass
+    return records
+
+
+def search_review_history(
+    query: str = "",
+    model_filter: str = "",
+    min_score: int = 0,
+    max_score: int = 100,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Search review history with full-text semantic search (TF-IDF).
+
+    Args:
+        query: Free-text search (searches file names, dimension summaries,
+               strengths, weaknesses, suggestions via TF-IDF cosine similarity).
+        model_filter: Filter by model name (substring match).
+        min_score: Minimum overall score.
+        max_score: Maximum overall score.
+        limit: Maximum records to return.
+
+    Returns:
+        List of matching review summaries, ranked by relevance when query is provided.
+    """
+    idx = _build_search_index()
+    docs = idx["docs"]
+    if not docs:
+        return []
+
+    # Apply model + score filters first (fast)
+    filtered = []
+    for entry in docs:
+        d = entry["data"]
+        model_val = d.get("model", "")
+        score = d.get("overallScore", 0)
+
+        if model_filter and model_filter.lower() not in model_val.lower():
+            continue
+        if score < min_score or score > max_score:
+            continue
+        filtered.append(entry)
+
+    if not filtered:
+        return []
+
+    # If no query text, return chronologically sorted
+    if not query or not query.strip():
+        results = []
+        for entry in filtered:
+            d = entry["data"]
+            results.append({
+                "id": d.get("id", ""),
+                "fileName": d.get("fileName", "Unknown"),
+                "model": d.get("model", ""),
+                "overallScore": d.get("overallScore", 0),
+                "dimensionCount": d.get("dimensionCount", 0),
+                "timestamp": d.get("timestamp", ""),
+            })
+        return results[:limit]
+
+    # TF-IDF ranking
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return filtered[:limit]
+
+    q_tf: dict[str, float] = {}
+    for t in query_tokens:
+        q_tf[t] = 1.0 + math.log(query_tokens.count(t))
+
+    idf = idx["idf"]
+    q_vec = _normalize({t: v * idf.get(t, 1.0) for t, v in q_tf.items()})
+
+    # Map filtered entries back to index positions
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for entry in filtered:
+        doc_idx = docs.index(entry)  # linear scan — fine for small scale
+        tfv = idx["tf_vectors"][doc_idx]
+        doc_vec = _normalize({t: v * idf.get(t, 1.0) for t, v in tfv.items()})
+        sim = _cosine_sim(q_vec, doc_vec)
+        scored.append((sim, entry))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+    for sim, entry in scored[:limit]:
+        d = entry["data"]
+        results.append({
+            "id": d.get("id", ""),
+            "fileName": d.get("fileName", "Unknown"),
+            "model": d.get("model", ""),
+            "overallScore": d.get("overallScore", 0),
+            "dimensionCount": d.get("dimensionCount", 0),
+            "timestamp": d.get("timestamp", ""),
+            "_relevance": round(sim, 4),
+        })
+
+    return results
+
+
+def load_review_by_id(review_id: str) -> dict[str, Any] | None:
+    """Load a specific review record by ID."""
+    path = _review_history_path(review_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def delete_review(review_id: str) -> bool:
+    """Delete a review record by ID."""
+    path = _review_history_path(review_id)
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def load_leaderboard(
+    sort_by: str = "score",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Load and rank reviews by score for comparison."""
+    records = load_review_history()
+    if sort_by == "score":
+        records.sort(key=lambda r: r.get("overallScore", 0), reverse=True)
+    elif sort_by == "date":
+        records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return records[:limit]

@@ -1,0 +1,44 @@
+project:
+  name: "rc-test"
+  mode: "full-auto"
+research:
+  topic: "test-driven science"
+  domains: ["ml"]
+  daily_paper_count: 2
+  idea_count: 3
+  quality_threshold: 7.0
+  graceful_degradation: true
+  reference_papers: []
+notifications:
+  channel: "console"
+knowledge_base:
+  backend: "markdown"
+  root: "docs/kb"
+openclaw_bridge:
+  use_message: false
+  use_memory: false
+llm:
+  provider: "openai-compatible"
+  base_url: "http://localhost:1234/v1"
+  api_key: "test"
+  api_key_env: "RESEARCHCLAW_API_KEY"
+  primary_model: "Qwen3.5-122B-A10B-FP8"
+  coding_model: "Qwen3.5-122B-A10B-FP8"
+  image_model: "Qwen3.5-122B-A10B-FP8"
+  fallback_models: []
+security:
+  hitl_required_stages: []
+experiment:
+  mode: "sandbox"
+  time_budget_sec: 120
+  max_iterations: 1
+  metric_key: "primary_metric"
+  metric_direction: "maximize"
+  datasets_dir: ""
+  checkpoints_dir: ""
+  codebases_dir: ""
+  shared_results_dir: "runs/shared_results"
+runtime:
+  timezone: "UTC"
+web_search:
+  enabled: false
