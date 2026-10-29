@@ -14,8 +14,6 @@ import json
 import logging
 import os
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,9 +34,11 @@ class TurnResult:
     files: dict[str, str] = field(default_factory=dict)
     iterations: int = 0
     tool_calls: int = 0
+    tool_errors: int = 0
     errors: list[str] = field(default_factory=list)
     final_text: str = ""
     elapsed_sec: float = 0.0
+    failure_kind: str = ""
 
 
 class SessionProtocol(Protocol):
@@ -106,7 +106,7 @@ class _TraceLog:
             self._write(f"**Command:**\n```bash\n{cmd}\n```\n")
         elif name == "write_file":
             path = input_data.get("path", "?")
-            content = input_data.get("content", "")
+            content = str(input_data.get("content", ""))
             n_lines = len(content.splitlines())
             self._write(f"**Path:** `{path}` ({n_lines} lines, {len(content)} chars)\n")
         elif name == "edit_file":
@@ -134,6 +134,7 @@ class _TraceLog:
             f"\n---\n## Summary\n"
             f"- Iterations: {result.iterations}\n"
             f"- Tool calls: {result.tool_calls}\n"
+            f"- Tool errors: {result.tool_errors}\n"
             f"- Files produced: {sorted(result.files.keys())}\n"
             f"- Errors: {len(result.errors)}\n"
             f"- Elapsed: {result.elapsed_sec:.1f}s\n"
@@ -178,21 +179,28 @@ class AgentTurnLoop:
         tool_specs: list[dict[str, Any]] | None = None,
         verification_hooks: list[VerificationHook] | None = None,
         trace_prefix: str = "generation",
+        completion_check: Callable[[Path], str | None] | None = None,
+        history_chars: int = 100000,
     ) -> None:
         self._llm_config = llm_config
         self._workspace = workspace
-        self._system_prompt = system_prompt
+        from researchclaw.orchestration.context import augment_system, skill_read_directories
+        self._system_prompt = augment_system(system_prompt) or system_prompt
+        allowed_read_dirs = [*(allowed_read_dirs or []), *(Path(p).expanduser().resolve() for p in skill_read_directories())]
         self._session = session
         self._max_iterations = max_iterations
         self._messages: list[dict[str, Any]] = []
         self._tool_specs = tool_specs or TOOL_SPECS
         self._verification_hooks = list(verification_hooks or [])
+        self._completion_check = completion_check
+        self._history_chars = history_chars
 
         self._executor = ToolExecutor(
             workspace=workspace,
             allowed_read_dirs=allowed_read_dirs,
             bash_timeout=bash_timeout,
             python_path=python_path,
+            journal_path=workspace.parent / "harness" / f"{trace_prefix}_tool_events.jsonl",
         )
         self._permissions = SandboxPermissionPolicy(
             workspace=workspace,
@@ -225,8 +233,12 @@ class AgentTurnLoop:
         self._messages.append({"role": "user", "content": user_message})
 
         result = TurnResult()
+        completion_corrections = 0
 
         for iteration in range(self._max_iterations):
+            from researchclaw.orchestration.compaction import compact_history
+            self._messages = compact_history(self._messages, self._workspace.parent / "harness" / self._trace._path.stem,
+                                             self._history_chars)
             iter_num = iteration + 1
             self._trace.iteration_start(iter_num, self._max_iterations)
             self._session.log(
@@ -240,33 +252,27 @@ class AgentTurnLoop:
             )
 
             response = None
-            _max_retries = 5
+            from researchclaw.llm.retry import retryable_model_error
+            _max_retries = max(1, int(getattr(self._llm_config, "max_retries", 5)))
             for _retry in range(_max_retries):
                 try:
+                    self._session.llm_calls += 1
                     response = self._call_llm()
-                    _usage = (response or {}).get("usage", {})
-                    _comp = _usage.get("completion_tokens", -1)
-                    if _comp == 0:
-                        self._session.log(
-                            "EXECUTE",
-                            f"LLM attempt {_retry + 1}/{_max_retries}: "
-                            "empty completion (0 tokens) — retrying",
-                        )
-                        response = None
-                        time.sleep(2 ** min(_retry, 3))
-                        continue
                     break
                 except Exception as exc:
                     self._session.log(
                         "EXECUTE",
                         f"LLM call attempt {_retry + 1}/{_max_retries} failed: {exc}",
                     )
-                    if _retry < _max_retries - 1:
-                        time.sleep(2 ** min(_retry, 3))
+                    if _retry < _max_retries - 1 and retryable_model_error(exc):
+                        delay = min(30, getattr(self._llm_config, "retry_base_delay", 1) * 2 ** min(_retry, 3))
+                        time.sleep(delay)
                     else:
-                        error_msg = f"LLM call failed after {_max_retries} retries at iteration {iter_num}: {exc}"
+                        error_msg = f"LLM call failed after {_retry + 1} attempt(s) at iteration {iter_num}: {exc}"
                         self._session.log_error("EXECUTE", error_msg, exc)
                         result.errors.append(error_msg)
+                        result.failure_kind = "transport" if retryable_model_error(exc) else "model"
+                        break
             if response is None:
                 break
 
@@ -288,6 +294,16 @@ class AgentTurnLoop:
                 self._messages.append(self._build_assistant_message(response))
 
             if not tool_uses:
+                finish = (response.get("choices") or [{}])[0].get("finish_reason")
+                gap = self._completion_check(self._workspace) if self._completion_check else None
+                if finish == "length":
+                    gap = "Your response was truncated. Save smaller complete files with tools; do not claim completion from partial text."
+                if gap:
+                    if completion_corrections < 2:
+                        completion_corrections += 1
+                        self._messages.append({"role": "user", "content": "Completion check failed: " + gap})
+                        continue
+                    result.errors.append("Completion check failed: " + gap)
                 self._session.log(
                     "EXECUTE", f"Turn {iter_num}: no tool calls — loop complete",
                 )
@@ -304,14 +320,20 @@ class AgentTurnLoop:
                 tool_id = tu.get("id", f"call_{result.tool_calls}")
                 try:
                     tool_input = json.loads(tu["function"]["arguments"])
-                except (json.JSONDecodeError, KeyError):
-                    tool_input = {}
+                    if not isinstance(tool_input, dict):
+                        tool_input = {"_invalid_arguments": True}
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    tool_input = {"_invalid_arguments": True}
 
                 result.tool_calls += 1
-                self._session.llm_calls += 1
 
-                perm_error = self._permissions.check(tool_name, tool_input)
+                try:
+                    ToolExecutor.validate_input(tool_name, tool_input)
+                    perm_error = self._permissions.check(tool_name, tool_input)
+                except (ValueError, TypeError):
+                    perm_error = None  # The executor returns a typed input error.
                 if perm_error:
+                    result.tool_errors += 1
                     self._session.log("EXECUTE", f"  DENIED {tool_name}: {perm_error}")
                     self._trace.permission_denied(tool_name, perm_error)
                     if self._use_text_tools:
@@ -336,7 +358,11 @@ class AgentTurnLoop:
                     f"  Executing {tool_name}({self._summarize_input(tool_name, tool_input)})",
                 )
                 tool_t0 = time.monotonic()
-                tool_result, is_error = self._executor.execute(tool_name, tool_input)
+                outcome = self._executor.execute_structured(tool_name, tool_input)
+                is_error = outcome.is_error
+                tool_result = (f"[tool_error: {outcome.error_code}]\n" if is_error else "") + outcome.content
+                if is_error:
+                    result.tool_errors += 1
                 tool_elapsed_ms = int((time.monotonic() - tool_t0) * 1000)
 
                 self._trace.tool_call(
@@ -409,57 +435,18 @@ class AgentTurnLoop:
     # ------------------------------------------------------------------
 
     def _call_llm(self) -> dict[str, Any]:
-        cfg = self._llm_config
-        base_url = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
-        url = f"{base_url}/chat/completions"
+        from researchclaw.llm.tool_client import call_tool_model
 
         system_prompt = self._system_prompt
         if self._use_text_tools:
             system_prompt += self._text_tool_prompt
-
-        model = cfg.primary_model
-        if self._use_text_tools:
-            _coding = getattr(cfg, "coding_model", "") or ""
-            if _coding and self._is_claude_model(_coding):
-                model = _coding
-
-        _RESPONSES_API = ("gpt-5.", "gpt-5")
-        _is_responses_model = (
-            any(model.startswith(p) for p in _RESPONSES_API)
-            and not model.startswith("gpt-5.4")
-        )
-        _tok_key = "max_output_tokens" if _is_responses_model else "max_tokens"
-        _tok_val = 8192
-
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                *self._messages,
-            ],
-            _tok_key: _tok_val,
-        }
-
-        if not self._use_text_tools:
-            body["tools"] = self._api_tools
-            body["tool_choice"] = "auto"
-
-        if any(model.startswith(p) for p in ("o3", "o4", "gpt-5")):
-            body[_tok_key] = 16384
-
-        payload = json.dumps(body).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg.api_key}",
-        }
-
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        timeout = getattr(cfg, "timeout_sec", 600)
-
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-
-        return data
+        model = self._llm_config.primary_model
+        coding = getattr(self._llm_config, "coding_model", "") or ""
+        if self._use_text_tools and coding and self._is_claude_model(coding):
+            model = coding
+        messages = [{"role": "system", "content": system_prompt}, *self._messages]
+        return call_tool_model(self._llm_config, model, messages,
+                               [] if self._use_text_tools else self._api_tools)
 
     def _parse_response(
         self, data: dict[str, Any],
@@ -561,10 +548,8 @@ class AgentTurnLoop:
 
     @staticmethod
     def _build_assistant_message(data: dict[str, Any]) -> dict[str, Any]:
-        choices = data.get("choices", [])
-        if choices:
-            return choices[0].get("message", {"role": "assistant", "content": ""})
-        return {"role": "assistant", "content": ""}
+        from researchclaw.llm.tool_client import assistant_message
+        return assistant_message(data)
 
     def _build_api_tools(self) -> list[dict[str, Any]]:
         return [
@@ -667,11 +652,11 @@ class AgentTurnLoop:
     @staticmethod
     def _summarize_input(tool_name: str, inp: dict[str, Any]) -> str:
         if tool_name == "bash":
-            cmd = inp.get("command", "")
+            cmd = str(inp.get("command", ""))
             return cmd[:80] + ("..." if len(cmd) > 80 else "")
         elif tool_name in ("write_file", "edit_file"):
             path = inp.get("path", "?")
-            size = len(inp.get("content", inp.get("new_string", "")))
+            size = len(str(inp.get("content", inp.get("new_string", ""))))
             return f"{path} ({size} chars)"
         elif tool_name == "read_file":
             return inp.get("path", "?")

@@ -34,6 +34,10 @@ export default defineConfig({
         target: `http://localhost:${reviewPort}`,
         changeOrigin: true,
       },
+      '/api/health': {
+        target: `http://localhost:${reviewPort}`,
+        changeOrigin: true,
+      },
     },
   },
 })

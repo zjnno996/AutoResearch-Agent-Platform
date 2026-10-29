@@ -13,7 +13,8 @@ from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.evolution import EvolutionStore, extract_lessons
 from researchclaw.knowledge.base import write_stage_to_kb
-from researchclaw.pipeline.executor import StageResult, execute_stage
+from researchclaw.pipeline.models import StageResult
+from researchclaw.pipeline.runtime import execute_stage
 from researchclaw.pipeline.stages import (
     DECISION_ROLLBACK,
     MAX_DECISION_PIVOTS,
@@ -43,15 +44,16 @@ def _build_pipeline_summary(
     from_stage: Stage,
     run_dir: Path | None = None,
 ) -> dict[str, object]:
+    current_results = list({item.stage: item for item in results}.values())
     invocation_done = sum(1 for item in results if item.status == StageStatus.DONE)
     invocation_blocked = sum(
         1 for item in results if item.status == StageStatus.BLOCKED_APPROVAL
     )
     invocation_failed = sum(
-        1 for item in results if item.status == StageStatus.FAILED
+        1 for item in current_results if item.status == StageStatus.FAILED
     )
-    stages_executed = len(results)
-    stages_done = invocation_done
+    stages_executed = len(current_results)
+    stages_done = sum(1 for item in current_results if item.status == StageStatus.DONE)
     final_stage = int(results[-1].stage) if results else int(from_stage)
     final_status = results[-1].status.value if results else "no_stages"
 
@@ -69,8 +71,6 @@ def _build_pipeline_summary(
             stages_executed = max(stages_executed, checkpoint_stage)
             stages_done = max(stages_done, checkpoint_stage)
             final_stage = max(final_stage, checkpoint_stage)
-            if checkpoint_stage >= int(Stage.CITATION_VERIFY):
-                final_status = StageStatus.DONE.value
 
     prior_degraded = False
     degradation_reasons: list[str] = []
@@ -169,10 +169,8 @@ def _build_pipeline_summary(
 
 
 def _write_pipeline_summary(run_dir: Path, summary: dict[str, object]) -> None:
-    (run_dir / "pipeline_summary.json").write_text(
-        json.dumps(summary, indent=2),
-        encoding="utf-8",
-    )
+    from researchclaw.orchestration.artifacts import write_json
+    write_json(run_dir / "pipeline_summary.json", summary)
 
 
 def _write_checkpoint(run_dir: Path, stage: Stage, run_id: str) -> None:
@@ -211,9 +209,8 @@ def _write_heartbeat(run_dir: Path, stage: Stage, run_id: str) -> None:
         "run_id": run_id,
         "timestamp": _utcnow_iso(),
     }
-    (run_dir / "heartbeat.json").write_text(
-        json.dumps(heartbeat, indent=2), encoding="utf-8"
-    )
+    from researchclaw.orchestration.artifacts import write_json
+    write_json(run_dir / "heartbeat.json", heartbeat)
 
 
 def read_checkpoint(run_dir: Path) -> Stage | None:
@@ -347,19 +344,43 @@ def execute_pipeline(
     skip_noncritical: bool = False,
     kb_root: Path | None = None,
 ) -> list[StageResult]:
+    """Own the run while scheduling stages and reentrant bounded repairs."""
+    from researchclaw.orchestration.lease import run_lease
+    with run_lease(run_dir, run_id):
+        if config.research_engine.enabled and config.research_engine.workflow == "compact":
+            from researchclaw.orchestration.compact import execute_compact
+            return execute_compact(run_dir=run_dir, run_id=run_id, config=config,
+                                   from_stage=from_stage, to_stage=to_stage)
+        return _execute_pipeline(
+            run_dir=run_dir, run_id=run_id, config=config, adapters=adapters,
+            from_stage=from_stage, to_stage=to_stage, auto_approve_gates=auto_approve_gates,
+            stop_on_gate=stop_on_gate, skip_noncritical=skip_noncritical, kb_root=kb_root,
+        )
+
+
+def _execute_pipeline(
+    *,
+    run_dir: Path,
+    run_id: str,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    from_stage: Stage = Stage.TOPIC_INIT,
+    to_stage: Stage | None = None,
+    auto_approve_gates: bool = False,
+    stop_on_gate: bool = False,
+    skip_noncritical: bool = False,
+    kb_root: Path | None = None,
+) -> list[StageResult]:
     """Execute pipeline stages sequentially from `from_stage` to `to_stage` (inclusive)."""
 
+    from researchclaw.orchestration.artifacts import write_json
+    from researchclaw.pipeline.graph import StageGraph
+    graph = StageGraph()
+    write_json(run_dir / "research_execution_plan.json", graph.describe(from_stage, to_stage))
     results: list[StageResult] = []
-    started = False
-    total_stages = len(STAGE_SEQUENCE)
+    total_stages = len(graph.order)
 
-    for stage in STAGE_SEQUENCE:
-        if to_stage is not None and int(stage) > int(to_stage):
-            break
-        started = _should_start(stage, from_stage, started)
-        if not started:
-            continue
-
+    for stage in graph.execution_order(from_stage, to_stage):
         stage_num = int(stage)
         prefix = f"[{run_id}] Stage {stage_num:02d}/{total_stages}"
 
@@ -422,6 +443,24 @@ def execute_pipeline(
 
         # --- Heartbeat for sentinel watchdog ---
         _write_heartbeat(run_dir, stage, run_id)
+
+        # Target the stage that owns the failed scientific requirement. A
+        # writing-only loop cannot repair missing experiments or controls.
+        if config.research_engine.enabled and result.status in (StageStatus.DONE, StageStatus.FAILED):
+            from researchclaw.orchestration.repair import begin_repair, complete_repair, propose_repair
+            complete_repair(run_dir, stage_num)
+            repair = propose_repair(run_dir, stage_num, config)
+            if repair is not None:
+                begin_repair(run_dir, repair, run_id)
+                print(f"[{run_id}] Research repair {repair['round']}: "
+                      f"{len(repair['actions'])} unmet criteria → stage {repair['from_stage']}")
+                results.extend(execute_pipeline(
+                    run_dir=run_dir, run_id=run_id, config=config, adapters=adapters,
+                    from_stage=Stage(repair["from_stage"]), to_stage=to_stage,
+                    auto_approve_gates=auto_approve_gates, stop_on_gate=stop_on_gate,
+                    skip_noncritical=skip_noncritical, kb_root=kb_root,
+                ))
+                break
 
         # --- PIVOT/REFINE decision handling ---
         if (
@@ -523,6 +562,15 @@ def execute_pipeline(
         from_stage=from_stage,
         run_dir=run_dir,
     )
+    if config.research_engine.enabled:
+        from researchclaw.orchestration.artifacts import read_json
+        summary["research_engine"] = read_json(run_dir / "research_engine_summary.json")
+        summary["research_repairs"] = read_json(run_dir / "research_repair_history.json")
+        if summary["research_engine"].get("all_satisfied"):
+            summary["historical_degraded"] = summary["degraded"]
+            summary["degradation_reasons"] = [reason for reason in summary["degradation_reasons"]
+                                               if reason != "stage_decision_degraded"]
+            summary["degraded"] = bool(summary["degradation_reasons"])
     _write_pipeline_summary(run_dir, summary)
 
     # --- LLM trace summary: aggregate request/input/output records ---
@@ -613,7 +661,7 @@ def _package_deliverables(
     ):
         try:
             from researchclaw.templates import get_template, markdown_to_latex
-            from researchclaw.pipeline.executor import _extract_paper_title
+            from researchclaw.pipeline.support.templates import _extract_paper_title
 
             tpl = get_template(config.export.target_conference)
             v_text = verified_md.read_text(encoding="utf-8")
@@ -741,6 +789,17 @@ def _package_deliverables(
                 shutil.copy2(src, dest / out_name)
                 packaged.append(out_name)
                 break
+
+    for name in ("research_rubric.json", "research_verification.json", "research_state.json",
+                 "research_engine_summary.json", "research_repair_history.json", "research_trace.jsonl",
+                 "research_execution_plan.json", "research_method_plan.json",
+                 "research_identity.json", "llm_trace_summary.json"):
+        source = run_dir / name
+        if name == "llm_trace_summary.json":
+            source = run_dir / "traces" / "llm_trace_summary.json"
+        if source.is_file():
+            shutil.copy2(source, dest / name)
+            packaged.append(name)
 
     # --- 5b. Sanitization report (degraded mode) ---
     san_src = run_dir / "stage-22" / "sanitization_report.json"

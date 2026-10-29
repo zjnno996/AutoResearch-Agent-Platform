@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import os
+import sys
 from typing import Any
 
 import yaml
@@ -80,6 +82,8 @@ class ResearchConfig:
     graceful_degradation: bool = True
     reference_papers: tuple[str, ...] = ()
     paper_source_mode: str = "hybrid"
+    # Preserve legacy reproduction projects; benchmark related_work is background.
+    reference_purpose: str = "reproduction"
 
 
 @dataclass(frozen=True)
@@ -137,6 +141,8 @@ class LlmConfig:
     coding_model: str = ""
     image_model: str = ""
     fallback_models: tuple[str, ...] = ()
+    max_tokens: int = 4096
+    reasoning_token_reserve: int = 0
     timeout_sec: int = 300
     max_retries: int = 3
     retry_base_delay: float = 2.0
@@ -403,6 +409,44 @@ class PromptsConfig:
     """Configuration for prompt externalization."""
 
     custom_file: str = ""  # Path to custom prompts YAML (empty = use defaults)
+
+
+@dataclass(frozen=True)
+class ResearchEngineConfig:
+    """Evidence-driven research orchestration; enabled in the shipped configs.
+
+    Older configurations without this section retain their execution policy.
+    Efficiency changes are opt-in until a quality comparison approves them.
+    """
+
+    enabled: bool = False
+    workflow: str = "legacy"
+    phase_max_iterations: int = 16
+    max_model_calls: int = 48
+    artifact_reasoning_effort: str = "none"
+    method_analysis_first: bool = False
+    public_source_search: bool = True
+    public_source_cache_dir: str = ''
+    max_source_queries: int = 2
+    max_public_sources: int = 2
+    source_context_chars: int = 96000
+    formal_source_context_chars: int = 256000
+    profile: str = "quality_first"
+    study_type: str = "auto"
+    max_repair_rounds: int = 2
+    target_quality_score: float = 7.0
+    council_enabled: bool = True
+    rubric_enabled: bool = True
+    skills_enabled: bool = True
+    skills_dirs: tuple[str, ...] = ()
+    max_skills_per_stage: int = 3
+    skill_context_chars: int = 24000
+    memory_context_chars: int = 8000
+    evidence_context_chars: int = 48000
+    shared_memory: bool = True
+    # The balanced efficiency profile needs a measured quality comparison.
+    efficiency_approval: str = ""
+
 @dataclass(frozen=True)
 class RCConfig:
     project: ProjectConfig
@@ -420,6 +464,7 @@ class RCConfig:
     metaclaw_bridge: MetaClawBridgeConfig = field(
         default_factory=MetaClawBridgeConfig
     )
+    research_engine: ResearchEngineConfig = field(default_factory=ResearchEngineConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -451,6 +496,7 @@ class RCConfig:
         prompts = data.get("prompts") or {}
         web_search = data.get("web_search") or {}
         metaclaw = data.get("metaclaw_bridge") or {}
+        engine = data.get("research_engine") or {}
 
         return cls(
             project=ProjectConfig(
@@ -464,6 +510,7 @@ class RCConfig:
                 quality_threshold=float(research.get("quality_threshold", 0.0)),
                 graceful_degradation=bool(research.get("graceful_degradation", True)),
                 reference_papers=tuple(research.get("reference_papers") or ()),
+                reference_purpose=str(research.get("reference_purpose", "reproduction")),
                 paper_source_mode=str(research.get("paper_source_mode", "hybrid") or "hybrid"),
             ),
             runtime=RuntimeConfig(
@@ -529,6 +576,34 @@ class RCConfig:
                 max_crawl_urls=int(web_search.get("max_crawl_urls", 5)),
             ),
             metaclaw_bridge=_parse_metaclaw_bridge_config(metaclaw),
+            research_engine=ResearchEngineConfig(
+                enabled=engine.get("enabled", False),
+                workflow=engine.get("workflow", "legacy"),
+                phase_max_iterations=engine.get("phase_max_iterations", 16),
+                max_model_calls=engine.get("max_model_calls", 48),
+                artifact_reasoning_effort=engine.get("artifact_reasoning_effort", "none"),
+                method_analysis_first=engine.get("method_analysis_first", False),
+                public_source_search=engine.get("public_source_search", True),
+                public_source_cache_dir=engine.get('public_source_cache_dir', ''),
+                max_source_queries=engine.get("max_source_queries", 2),
+                max_public_sources=engine.get("max_public_sources", 2),
+                source_context_chars=engine.get("source_context_chars", 96000),
+                formal_source_context_chars=engine.get("formal_source_context_chars", 256000),
+                profile=engine.get("profile", "quality_first"),
+                study_type=engine.get("study_type", "auto"),
+                max_repair_rounds=engine.get("max_repair_rounds", 2),
+                target_quality_score=float(engine.get("target_quality_score", 7.0)),
+                council_enabled=engine.get("council_enabled", True),
+                rubric_enabled=engine.get("rubric_enabled", True),
+                skills_enabled=engine.get("skills_enabled", True),
+                skills_dirs=tuple(engine.get("skills_dirs") or ()),
+                max_skills_per_stage=engine.get("max_skills_per_stage", 3),
+                skill_context_chars=engine.get("skill_context_chars", 24000),
+                memory_context_chars=engine.get("memory_context_chars", 8000),
+                evidence_context_chars=engine.get("evidence_context_chars", 48000),
+                shared_memory=engine.get("shared_memory", True),
+                efficiency_approval=str(engine.get("efficiency_approval", "")),
+            ),
         )
 
     @classmethod
@@ -593,12 +668,66 @@ def validate_config(
                     )
 
     exp_mode = _get_by_path(data, "experiment.mode")
+    reference_purpose = _get_by_path(data, "research.reference_purpose")
+    if reference_purpose is not None and reference_purpose not in ("background", "reproduction"):
+        errors.append("research.reference_purpose must be background or reproduction")
+    output_limit = _get_by_path(data, "llm.max_tokens")
+    if output_limit is not None and (type(output_limit) is not int or output_limit < 1):
+        errors.append("llm.max_tokens must be a positive integer")
+    reasoning_reserve = _get_by_path(data, "llm.reasoning_token_reserve")
+    if reasoning_reserve is not None and (type(reasoning_reserve) is not int or reasoning_reserve < 0):
+        errors.append("llm.reasoning_token_reserve must be a nonnegative integer")
     if not _is_blank(exp_mode) and exp_mode not in EXPERIMENT_MODES:
         errors.append(f"Invalid experiment.mode: {exp_mode}")
 
     exp_direction = _get_by_path(data, "experiment.metric_direction")
     if not _is_blank(exp_direction) and exp_direction not in ("minimize", "maximize"):
         errors.append(f"Invalid experiment.metric_direction: {exp_direction}")
+
+    engine = data.get("research_engine", {})
+    if not isinstance(engine, dict):
+        errors.append("research_engine must be a mapping")
+    else:
+        if not isinstance(engine.get('public_source_cache_dir', ''), str):
+            errors.append('research_engine.public_source_cache_dir must be a string path or empty')
+        for key in ("enabled", "council_enabled", "rubric_enabled", "skills_enabled", "shared_memory", "public_source_search", "method_analysis_first"):
+            if key in engine and not isinstance(engine[key], bool):
+                errors.append(f"research_engine.{key} must be a boolean")
+        for key, lower, upper in (
+            ("max_repair_rounds", 0, 8), ("max_skills_per_stage", 1, 10),
+            ("phase_max_iterations", 4, 100),
+            ("max_model_calls", 12, 500),
+            ("max_source_queries", 1, 4), ("max_public_sources", 1, 4),
+            ("source_context_chars", 16000, 1000000),
+            ("formal_source_context_chars", 16000, 1000000),
+            ("skill_context_chars", 1000, 100000),
+            ("memory_context_chars", 1000, 50000),
+            ("evidence_context_chars", 4000, 200000),
+        ):
+            value = engine.get(key)
+            if key == 'max_model_calls' and type(value) is int and value == 0:
+                continue  # Explicit quality-only deployment: count calls without a quota.
+            if value is not None and (type(value) is not int or not lower <= value <= upper):
+                errors.append(f"research_engine.{key} must be an integer in [{lower}, {upper}]")
+        if engine.get("profile", "quality_first") not in {"quality_first", "balanced"}:
+            errors.append("research_engine.profile must be quality_first or balanced")
+        if engine.get("workflow", "legacy") not in {"compact", "legacy"}:
+            errors.append("research_engine.workflow must be compact or legacy")
+        if engine.get("artifact_reasoning_effort", "none") not in {"none", "low", "high", "max"}:
+            errors.append("research_engine.artifact_reasoning_effort must be none, low, high or max")
+        if engine.get("workflow") == "compact" and (data.get("experiment") or {}).get("mode", "simulated") != "sandbox":
+            errors.append("compact workflow requires experiment.mode=sandbox; use legacy for remote, Docker or simulated execution")
+        from researchclaw.orchestration.methods import STUDY_TYPES
+        if engine.get("study_type", "auto") not in STUDY_TYPES:
+            errors.append("research_engine.study_type must be one of " + ", ".join(STUDY_TYPES))
+        dirs = engine.get("skills_dirs", [])
+        score = engine.get("target_quality_score", 7.0)
+        if type(score) not in (int, float) or not 1 <= score <= 10:
+            errors.append("research_engine.target_quality_score must be a number in [1, 10]")
+        if not isinstance(dirs, list) or any(not isinstance(p, str) for p in dirs):
+            errors.append("research_engine.skills_dirs must be a list of paths")
+        if engine.get("profile") == "balanced" and not engine.get("efficiency_approval"):
+            errors.append("balanced profile requires research_engine.efficiency_approval from a quality comparison")
 
     kb_root_raw = _get_by_path(data, "knowledge_base.root")
     if check_paths and not _is_blank(kb_root_raw) and project_root is not None:
@@ -617,6 +746,11 @@ def validate_config(
 
 
 def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
+    from researchclaw.llm.provider_policy import locked_provider_settings, provider_request_options
+    policy = locked_provider_settings()
+    if policy:
+        data = {**data, **policy, 'extra_body': provider_request_options(data.get('extra_body')),
+                'strip_thinking': True}
     acp_data = data.get("acp") or {}
     return LlmConfig(
         provider=data.get("provider", "openai-compatible"),
@@ -627,6 +761,8 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         coding_model=data.get("coding_model", ""),
         image_model=data.get("image_model", ""),
         fallback_models=tuple(data.get("fallback_models") or ()),
+        max_tokens=int(data.get("max_tokens", 4096)),
+        reasoning_token_reserve=int(data.get("reasoning_token_reserve", 0)),
         timeout_sec=int(data.get("timeout_sec", 300)),
         max_retries=int(data.get("max_retries", 3)),
         retry_base_delay=float(data.get("retry_base_delay", 2.0)),
@@ -663,7 +799,8 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         shared_results_dir=data.get("shared_results_dir", ""),
         paper_length=data.get("paper_length", "medium"),
         sandbox=SandboxConfig(
-            python_path=sandbox_data.get("python_path", ".venv/bin/python3"),
+            python_path=(sandbox_data.get("python_path", ".venv/bin/python3")
+                         or os.environ.get("EMNETS_SANDBOX_PYTHON", "") or sys.executable),
             gpu_required=bool(sandbox_data.get("gpu_required", False)),
             allowed_imports=tuple(
                 sandbox_data.get("allowed_imports", SandboxConfig.allowed_imports)

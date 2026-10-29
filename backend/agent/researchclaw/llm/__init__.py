@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
@@ -31,7 +32,7 @@ PROVIDER_PRESETS = {
     },
 }
 
-DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://www.longcatcloud.com/v1"
+DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:8000/v1"
 
 
 def resolve_provider_base_url(provider: str, configured_base_url: str = "") -> str:
@@ -46,7 +47,9 @@ def resolve_provider_base_url(provider: str, configured_base_url: str = "") -> s
         return str(preset_base_url).rstrip("/")
 
     if provider == "openai-compatible":
-        return DEFAULT_OPENAI_COMPATIBLE_BASE_URL
+        return (os.environ.get("EMNETS_API_BASE", "").strip()
+                or os.environ.get("OPENAI_BASE_URL", "").strip()
+                or DEFAULT_OPENAI_COMPATIBLE_BASE_URL).rstrip("/")
 
     return "https://api.openai.com/v1"
 
@@ -66,7 +69,8 @@ def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
     a drop-in replacement with access to 200+ models from Anthropic, Google,
     Meta, Mistral, and more. See: https://openrouter.ai/models
     """
-    if config.llm.provider == "acp":
+    from researchclaw.llm.provider_policy import provider_lock_enabled
+    if config.llm.provider == "acp" and not provider_lock_enabled():
         from researchclaw.llm.acp_client import ACPClient as _ACP
         return _ACP.from_rc_config(config)
 

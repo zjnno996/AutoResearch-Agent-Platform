@@ -112,6 +112,25 @@ def test_validate_config_with_valid_data_returns_ok_true(tmp_path: Path):
     assert result.errors == ()
 
 
+@pytest.mark.parametrize("reserve", [-1, True, "8192", 1.5])
+def test_reasoning_reserve_rejects_invalid_token_budgets(tmp_path: Path, reserve):
+    data = _valid_config_data()
+    data["llm"]["reasoning_token_reserve"] = reserve
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+    assert "llm.reasoning_token_reserve must be a nonnegative integer" in result.errors
+
+
+def test_reasoning_reserve_survives_yaml_loading(tmp_path: Path):
+    import yaml
+    data = _valid_config_data()
+    data["llm"].update(max_tokens=32768, reasoning_token_reserve=8192)
+    path = tmp_path / "thinking.yaml"
+    path.write_text(yaml.safe_dump(data))
+    config = RCConfig.load(path, check_paths=False)
+    assert config.llm.max_tokens == 32768
+    assert config.llm.reasoning_token_reserve == 8192
+
+
 def test_validate_config_missing_required_fields_returns_errors(tmp_path: Path):
     data = _valid_config_data()
     data["research"] = {}

@@ -1,10 +1,11 @@
 #!/bin/bash
-# Claw Research Web — start/stop the new frontend-web plus required backend services
+# EMNETS-RA Web — start/stop the new frontend-web plus required backend services
 # Usage: ./start-web.sh [start|stop|restart|status]
 
 set -u
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
+. "$BASE/scripts/load-provider-env.sh"
 WEB="$BASE/frontend-web"
 LOG="$BASE/logs"
 PIDF="$BASE/.pids"
@@ -17,7 +18,9 @@ for _cfg in "$BASE/config.arc.yaml" "$BASE/examples/config_template.yaml" "$BASE
     [ -n "$_cfg_py" ] && [ -x "$_cfg_py" ] && break
     _cfg_py=""
 done
-PY="${PYTHON_PATH:-${_cfg_py:-python3}}"
+_web_py=""
+[ -x "$BASE/.venv-web/bin/python" ] && _web_py="$BASE/.venv-web/bin/python"
+PY="${PYTHON_PATH:-${_web_py:-${_cfg_py:-python3}}}"
 PY_CMD_PATH="$(command -v "$PY" 2>/dev/null || true)"
 if [ -x "$PY_CMD_PATH" ]; then
     export PATH="$(dirname "$PY_CMD_PATH"):$PATH"
@@ -46,6 +49,25 @@ is_port_listening() {
         "$PY" - "$port" <<'PYEOF' >/dev/null 2>&1
 import socket
 import sys
+from pathlib import Path
+# Linux can inspect LISTEN sockets without opening an incomplete WebSocket
+# handshake. Keep the ordinary socket fallback for other platforms.
+tables = [Path('/proc/net/tcp'), Path('/proc/net/tcp6')]
+if tables[0].is_file():
+    try:
+        loopbacks = {'00000000', '0100007F', '0' * 32, '00000000000000000000000001000000'}
+        for table in tables:
+            if not table.exists():
+                continue
+            for line in table.read_text().splitlines()[1:]:
+                fields = line.split()
+                address, encoded_port = fields[1].split(':')
+                if fields[3] == '0A' and address in loopbacks and int(encoded_port, 16) == int(sys.argv[1]):
+                    raise SystemExit(0)
+    except (OSError, ValueError, IndexError):
+        pass
+    else:
+        raise SystemExit(1)
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.settimeout(0.3)
 try:
@@ -117,10 +139,10 @@ kill_pattern_processes() {
 
 ensure_node_path() {
     local node_dir=""
-    if [ -x /opt/conda/envs/clawailab/bin/node ]; then
-        node_dir="/opt/conda/envs/clawailab/bin"
-    elif [ -x /opt/conda/envs/clawailab/bin/npm ]; then
-        node_dir="/opt/conda/envs/clawailab/bin"
+    if [ -n "${EMNETS_NODE_BIN:-}" ] && [ -x "$EMNETS_NODE_BIN/node" ]; then
+        node_dir="$EMNETS_NODE_BIN"
+    elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/node" ]; then
+        node_dir="$CONDA_PREFIX/bin"
     fi
     if [ -n "$node_dir" ]; then
         export PATH="$node_dir:$PATH"
@@ -157,21 +179,21 @@ start_agent_bridge() {
         setsid "$PY" -u "$BASE/backend/services/agent_bridge.py" \
             --port "$AGENT_BRIDGE_PORT" --python "$PY" \
             --agent-dir "$BASE/backend/agent" \
-            --runs-dir "$BASE/backend/runs" \
-            --pool-idea 3 --pool-exp 2 --pool-code 3 --pool-exec 4 --pool-write 2 \
+            --runs-dir "${EMNETS_RUNS_DIR:-$BASE/backend/runs/web-workspace}" \
+            --pool-idea "${EMNETS_POOL_IDEA:-3}" --pool-exp "${EMNETS_POOL_EXP:-2}" --pool-code "${EMNETS_POOL_CODE:-3}" --pool-exec "${EMNETS_POOL_EXEC:-4}" --pool-write "${EMNETS_POOL_WRITE:-2}" \
             --total-gpus 8 --gpus-per-project 1 \
             --discussion-mode --discussion-rounds 2 \
-            --discussion-models "Qwen3.5-122B-A10B-FP8" \
+            --discussion-models "${EMNETS_MODEL:-Qwen3.8-27B-FP8}" \
             > "$LOG/agent_bridge.log" 2>&1 &
     else
         nohup "$PY" -u "$BASE/backend/services/agent_bridge.py" \
             --port "$AGENT_BRIDGE_PORT" --python "$PY" \
             --agent-dir "$BASE/backend/agent" \
-            --runs-dir "$BASE/backend/runs" \
-            --pool-idea 3 --pool-exp 2 --pool-code 3 --pool-exec 4 --pool-write 2 \
+            --runs-dir "${EMNETS_RUNS_DIR:-$BASE/backend/runs/web-workspace}" \
+            --pool-idea "${EMNETS_POOL_IDEA:-3}" --pool-exp "${EMNETS_POOL_EXP:-2}" --pool-code "${EMNETS_POOL_CODE:-3}" --pool-exec "${EMNETS_POOL_EXEC:-4}" --pool-write "${EMNETS_POOL_WRITE:-2}" \
             --total-gpus 8 --gpus-per-project 1 \
             --discussion-mode --discussion-rounds 2 \
-            --discussion-models "Qwen3.5-122B-A10B-FP8" \
+            --discussion-models "${EMNETS_MODEL:-Qwen3.8-27B-FP8}" \
             > "$LOG/agent_bridge.log" 2>&1 &
     fi
     local pid=$!
@@ -232,7 +254,7 @@ start_frontend_web() {
 }
 
 do_start() {
-    echo "🦞 启动 Claw Research Web..."
+    echo "🔬 启动 EMNETS-RA Web..."
     echo ""
     local failed=0
     start_resource_monitor || failed=1
@@ -253,7 +275,7 @@ do_start() {
 }
 
 do_stop() {
-    echo "🛑 停止 Claw Research Web 相关服务..."
+    echo "🛑 停止 EMNETS-RA Web 相关服务..."
     for svc in frontend_web agent_bridge resource_monitor review_service; do
         f="$PIDF/$svc.pid"
         if [ -f "$f" ]; then
@@ -275,7 +297,7 @@ do_stop() {
 }
 
 do_status() {
-    echo "📊 Claw Research Web 状态:"
+    echo "📊 EMNETS-RA Web 状态:"
     if is_port_listening "$RESOURCE_MONITOR_PORT"; then
         echo -e "  ${G}● resource_monitor${N} (port $RESOURCE_MONITOR_PORT)"
     else

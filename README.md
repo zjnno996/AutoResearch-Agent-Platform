@@ -1,22 +1,34 @@
-<p align="center">
-  <img src="assets/logo_v1.png" width="200" alt="Claw AI Lab">
-</p>
-
-<h2 align="center"><b>Claw AI Lab: An Autonomous Multi-Agent Research Team</b></h2>
+<h1 align="center">EMNETS-RA</h1>
+<p align="center"><b>emnets科研助手 · EMNETS Research Assistant</b></p>
 
 <!-- <p align="center">
   <b><i>One Command. A Complete Team.</i></b>
 </p> -->
 
 <p align="center">
-  <a href="https://clawailab.ai"><img src="https://img.shields.io/badge/Homepage-clawailab.ai-E63946?logo=google-chrome&logoColor=white" alt="Homepage"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
+  <a href="THIRD_PARTY_NOTICES.md"><img src="https://img.shields.io/badge/Licenses-notices-blue.svg" alt="Licenses and attribution"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+"></a>
-  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white" alt="Node.js 18+"></a>
-  <a href="https://github.com/Claw-AI-Lab/Claw-AI-Lab"><img src="https://img.shields.io/badge/GitHub-Claw--AI--Lab-6f42c1?logo=github&logoColor=white" alt="GitHub"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-20.19%2B-339933?logo=node.js&logoColor=white" alt="Node.js 20.19+"></a>
+  <a href="https://github.com/zjnno996/AutoResearch-Agent-Platform"><img src="https://img.shields.io/badge/GitHub-EMNETS--RA-6f42c1?logo=github&logoColor=white" alt="GitHub"></a>
 </p>
 
 ---
+
+## EMNETS 实验室 Web 工作空间（推荐）
+
+React + TypeScript 前端与 Python 后端组成完整的实验室工作空间：登录、真实项目总览、科研工作台、学术评审、研究技能库、全局搜索、深浅主题和移动端导航。视觉采用浙大求是蓝与 EMNETS 网络节点元素。
+
+```bash
+./scripts/setup-web.sh        # Python 3.11/3.12、Node 20.19+；安装前后端依赖
+./start-web.sh start          # 启动 Web 和三个后端服务
+./start-web.sh status
+```
+
+访问 **http://localhost:5910/**。已有环境可用 `PYTHON_PATH=/path/to/python ./start-web.sh start`。模型凭据留在后端，沿用配置的 Qwen3.8-27B-FP8。安装、接口、开源模板参考和浏览器测试见 [Web 工作空间文档](docs/web-workspace.md)。
+
+---
+
+<p align="center"><img src="assets/screenshots/emnets-ra-overview.png" alt="EMNETS-RA 实验室 Web 工作空间" width="100%" /></p>
 
 ## 🔥 Updates
 
@@ -31,19 +43,21 @@
 
 ## 🤔 What Is This?
 
-**Claw AI Lab** is a lab-native multi-agent research platform for interactive and scalable AI-driven science. It enables users to create a full AI research lab from a single prompt, with customizable roles, research directions, and collaborative workflows, rather than relying on a single-agent or fixed serial pipeline. Claw orchestrates multiple agents and projects in parallel through a FIFO-based scheduling framework, maximizing compute utilization while supporting cross-project knowledge sharing and mutual improvement. Crucially, the system keeps humans in the loop: users can intervene whenever needed, provide feedback under ambiguity, inject new ideas, and iteratively refine the research process through rollback and continuation. Combined with a simple UI that reduces everything to prompts and clicks, Claw transforms automated research into a more intuitive, steerable, and laboratory-like experience.
+**EMNETS-RA（emnets科研助手）** is a lab-native multi-agent research platform for interactive and scalable AI-driven science. It enables users to create a full AI research lab from a single prompt, with customizable roles, research directions, and collaborative workflows, rather than relying on a single-agent or fixed serial pipeline. EMNETS-RA orchestrates multiple agents and projects in parallel through a FIFO-based scheduling framework, maximizing compute utilization while supporting cross-project knowledge sharing and mutual improvement. Crucially, the system keeps humans in the loop: users can intervene whenever needed, provide feedback under ambiguity, inject new ideas, and iteratively refine the research process through rollback and continuation. Combined with a simple UI that reduces everything to prompts and clicks, EMNETS-RA transforms automated research into a more intuitive, steerable, and laboratory-like experience.
 
 <p align="center"><b>We welcome contributions from the community to make this project better together!</b><br><b>You are warmly invited to scroll to the bottom of the page to join our group for beta testing and discussion.</b></p>
 
 ---
 
-## 🖥️ Claw AI Lab Dashboard
+## 🖥️ EMNETS-RA Dashboard
 
 Launch projects, monitor agents, and inspect every artifact — all from a single interface. Real-time event stream · Multi-project overview · One-click rollback & resume · Artifact inspector.
 
 ---
 
 ## ✨ Key Features
+
+The evidence-driven research engine adds task-specific verification, independent specialist reviews, bounded repairs and **210 pinned research and engineering skills**. New complete local research tasks use six actual phases with hash-validated checkpoints and local repairs; historical runs retain the 26-stage workflow. Quality remains the priority. See [configuration, sources and evaluation limits](docs/research-engine.md) and the [architecture upgrade](docs/architecture-upgrade.md). For repeated external evaluations, see the [ResearchClawBench adapter and batch workflow](docs/researchclawbench.md).
 
 <table>
 <tr><td>🖥️</td><td><b>Interactive UI</b></td><td>Real-time web dashboard with event stream, data shelf, and multi-project monitoring</td></tr>
@@ -102,17 +116,17 @@ Multi-agent discussion on: **"What is the most deployable direction for Video Ac
 
 ---
 
-## 🚀 Quick Start
+## 桌面版兼容入口（历史界面）
 
 ### 1. Install
 
 ```bash
-git clone https://github.com/Claw-AI-Lab/Claw-AI-Lab.git
-cd Claw-AI-Lab
+git clone https://github.com/zjnno996/AutoResearch-Agent-Platform.git EMNETS-RA
+cd EMNETS-RA
 
 # Create python environment
-conda create -n clawailab python=3.11
-conda activate clawailab
+conda create -n emnets-ra python=3.11
+conda activate emnets-ra
 
 # Backend
 cd backend/agent
@@ -132,19 +146,16 @@ pip install torch torchvision diffusers transformers accelerate safetensors data
 
 ### 2. Configure
 
-Fill in following configurations in examples/config_template.yaml:
-```
-llm:
-  base_url: "your-api-endpoint"
-  api_key: "your-api-key"
-  primary_model: "Qwen3.5-122B-A10B-FP8"
-  coding_model: "Qwen3.5-122B-A10B-FP8"
-  image_model: "Qwen3.5-122B-A10B-FP8"
-  fallback_models: []
+Keep your model endpoint and credentials outside Git. For a new installation:
 
-sandbox:
-  python_path: "/absolute/path/to/clawailab/bin/python"  # Get this path by running: conda activate clawailab && which python
+```bash
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/emnets-ra"
+cp -n .env.example "${XDG_CONFIG_HOME:-$HOME/.config}/emnets-ra/provider.env"
+chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/emnets-ra/provider.env"
+# Edit the private provider.env: set your API base and API key.
 ```
+
+Launch scripts load this file automatically. `EMNETS_RA_ENV_FILE` can point to another private environment file. All model roles remain on the configured Qwen model; an empty sandbox Python path uses the current Python environment. See [deployment instructions](docs/web-workspace.md) and [publication hygiene](docs/publishing.md).
 
 ### 3. Run
 
@@ -165,7 +176,7 @@ Open **http://localhost:5903/** → Submit your research topic and let the agent
 | # | Recommendation | Why |
 |---|---|---|
 | 1 | **Prepare local codebases, datasets & checkpoints** — enter their paths when submitting a project | Avoids download delays and network failures during runs |
-| 2 | **Use a strong coding model like GPT 5.4** | Significantly better code quality and fewer iteration cycles |
+| 2 | **Use the configured Qwen model with native sampling** | Keep generation and review on the configured provider, and verify code by execution |
 | 3 | **Review the `IMPORTANT` fields in [Configuration Details](#️-configuration-details)** | Misconfigured API keys or resource limits are the #1 cause of failed runs |
 
 ---
@@ -212,12 +223,21 @@ openclaw_bridge:
 # === LLM ===
 llm:
   provider: "openai-compatible"   # LLM provider: "openai-compatible" | "openai" | "deepseek" | "acp"
-  api_key: "sk-your-key"          # ⚠️ **IMPORTANT** API key (or use api_key_env to read from environment)
-  api_key_env: "RESEARCHCLAW_API_KEY"  # Environment variable name for API key (fallback)
-  primary_model: "Qwen3.5-122B-A10B-FP8"        # ⚠️ **IMPORTANT** Main model for research, analysis, and writing
-  coding_model: "Qwen3.5-122B-A10B-FP8"         # ⚠️ **IMPORTANT** Model for code generation (S11)
-  image_model: "Qwen3.5-122B-A10B-FP8"          # Qwen3-only mode; external image generation is disabled by default
+  base_url: "http://localhost:8000/v1"
+  api_key: ""                    # Keep credentials in the private environment
+  api_key_env: "RESEARCHCLAW_API_KEY"
+  primary_model: "Qwen3.8-27B-FP8" # Research, analysis, and writing
+  coding_model: "Qwen3.8-27B-FP8"  # Code generation
+  image_model: "Qwen3.8-27B-FP8"   # Image understanding; external image generation is separate
   fallback_models: []
+  max_tokens: 262144             # Nominal context capacity; the quality-first launcher omits output token caps
+  reasoning_token_reserve: 0
+  timeout_sec: 600                # Quality-first: semantic inactivity timeout, not total streaming duration
+  extra_body:
+    chat_template_kwargs: {enable_thinking: true, reasoning_effort: xhigh}
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
 
 # === Security ===
 security:
@@ -264,7 +284,7 @@ prompts:
 
 ## 🙏 Acknowledgement
 
-We learned and reused code from the following projects: [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw), [AutoResearch](https://github.com/karpathy/autoresearch), [claw-code](https://github.com/ultraworkers/claw-code).
+EMNETS-RA builds on [Claw AI Lab](https://github.com/Claw-AI-Lab/Claw-AI-Lab) and the following projects: [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw), [AutoResearch](https://github.com/karpathy/autoresearch), [claw-code](https://github.com/ultraworkers/claw-code).
 
 We thank the authors for their contributions to the community!
 
@@ -274,7 +294,7 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ## 📌 Citation
 
-If you find Claw AI Lab useful, please cite:
+Upstream Claw AI Lab citation, retained for attribution:
 
 ```bibtex
 @misc{wu2026clawailab,

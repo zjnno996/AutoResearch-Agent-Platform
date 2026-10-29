@@ -40,7 +40,8 @@ if str(AGENT_DIR) not in sys.path:
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from review_engine.llm_client import get_model_options, _build_model_configs, register_config_section
+from review_engine.llm_client import get_model_options, _build_model_configs, register_config_section, get_preferred_review_model_name
+from review_engine.scoring import review_totals
 from review_engine.reviewer import (
     run_review,
     run_review_streaming,
@@ -70,28 +71,34 @@ def _write_ndjson(wfile, data: Any) -> None:
     wfile.flush()
 
 
-def _configured_qwen_endpoints() -> list[str]:
+def _configured_review_endpoints() -> list[str]:
+    from researchclaw.llm import resolve_provider_base_url
+    from researchclaw.llm.provider_policy import locked_provider_settings
+    locked = locked_provider_settings()
+    if locked:
+        return [locked["base_url"]]
     """Return configured model endpoints without exposing credentials."""
     try:
         import yaml
         config = yaml.safe_load((ROOT_DIR / "config.arc.yaml").read_text()) or {}
     except Exception:
         config = {}
-    sections: list[Any] = [config.get("web_chat_llm"), config.get("llm")]
+    sections: list[Any] = [config.get("review_llm"), config.get("web_chat_llm"), config.get("llm")]
+    preferred = next((str(s.get("primary_model", "")) for s in sections if isinstance(s, dict) and s.get("primary_model")), "")
     sections.extend(config.get("web_chat_llm_fallbacks", []) or [])
     endpoints: list[str] = []
     for section in sections:
         if not isinstance(section, dict):
             continue
         model = str(section.get("primary_model", ""))
-        base_url = str(section.get("base_url", "")).rstrip("/")
-        if "qwen" in model.lower() and base_url and base_url not in endpoints:
+        base_url = resolve_provider_base_url(section.get("provider", "openai-compatible"), str(section.get("base_url", "")))
+        if model == preferred and base_url and base_url not in endpoints:
             endpoints.append(base_url)
     return endpoints
 
 
-def _qwen_health(timeout_sec: float = 0.5) -> dict[str, Any]:
-    endpoints = _configured_qwen_endpoints()
+def _review_model_health(timeout_sec: float = 0.5) -> dict[str, Any]:
+    endpoints = _configured_review_endpoints()
     states: list[dict[str, Any]] = []
     for endpoint in endpoints:
         parsed = urllib.parse.urlparse(endpoint)
@@ -114,14 +121,14 @@ def _qwen_health(timeout_sec: float = 0.5) -> dict[str, Any]:
     }
 
 
-def _qwen_unavailable_message(health: dict[str, Any]) -> str:
+def _review_unavailable_message(health: dict[str, Any]) -> str:
     endpoint_states = health.get("endpoints", [])
     details = "; ".join(
         f"{item.get('endpoint', 'unknown')}: {item.get('error', 'unavailable')}"
         for item in endpoint_states
     )
     return (
-        "Qwen 评审模型当前不可用，本次未生成、未保存任何评审结果。"
+        "评审模型当前不可用，本次未生成、未保存任何评审结果。"
         + (f" 模型端点状态：{details}" if details else "")
     )
 
@@ -171,20 +178,21 @@ class ReviewHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == "/api/health":
-            qwen = _qwen_health()
+            health = _review_model_health()
             self._send_json(200, {
-                "status": "ok" if qwen["available"] else "degraded",
+                "status": "ok" if health["available"] else "degraded",
                 "service": "auto-review",
                 "businessService": "ok",
-                "qwen": qwen,
+                "reviewModel": health,
             })
         elif path == "/api/models":
             _build_model_configs()
-            qwen_models = [
+            preferred = get_preferred_review_model_name()
+            review_models = [
                 option for option in get_model_options()
-                if "qwen" in option.get("value", "").lower()
+                if option.get("value") == preferred
             ]
-            self._send_json(200, {"models": qwen_models})
+            self._send_json(200, {"models": review_models})
         elif path == "/api/review/history":
             records = load_review_history()
             self._send_json(200, {"history": records})
@@ -335,9 +343,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, err)
             return
 
-        qwen = _qwen_health()
-        if not qwen["available"]:
-            self._send_error_json(503, _qwen_unavailable_message(qwen))
+        health = _review_model_health()
+        if not health["available"]:
+            self._send_error_json(503, _review_unavailable_message(health))
             return
 
         if wants_stream:
@@ -353,12 +361,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 enable_debate=enable_debate, max_debates=max_debates, venue=venue,
                 min_finding_confidence=min_finding_confidence,
             )
-            overall = sum(r["score"] for r in results) // len(results) if results else 0
+            overall, dimension_count = review_totals(results)
             review_id = save_review(file_name, meta.get("review_model", model), dimensions, results, meta, overall_summary)
             resp: dict[str, Any] = {
                 "results": results,
                 "overallScore": overall,
-                "dimensionCount": len(results),
+                "dimensionCount": dimension_count,
                 "reviewId": review_id,
                 "meta": meta,
                 "verifiedFindings": meta.get("verifiedFindings", []),
@@ -489,9 +497,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
 
 
-        qwen = _qwen_health()
-        if not qwen["available"]:
-            self._send_error_json(503, _qwen_unavailable_message(qwen))
+        health = _review_model_health()
+        if not health["available"]:
+            self._send_error_json(503, _review_unavailable_message(health))
             return
 
         if wants_stream:
@@ -507,12 +515,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 enable_debate=enable_debate, max_debates=max_debates, venue=venue,
                 min_finding_confidence=min_finding_confidence,
             )
-            overall = sum(r["score"] for r in results) // len(results) if results else 0
+            overall, dimension_count = review_totals(results)
             review_id = save_review(file_name, meta.get("review_model", model), dimensions, results, meta, overall_summary)
             resp: dict[str, Any] = {
                 "results": results,
                 "overallScore": overall,
-                "dimensionCount": len(results),
+                "dimensionCount": dimension_count,
                 "reviewId": review_id,
                 "meta": meta,
                 "verifiedFindings": meta.get("verifiedFindings", []),
@@ -608,7 +616,7 @@ def main() -> None:
 
     try:
         _build_model_configs()
-        # Register Qwen3 from review_llm section so the review pipeline
+        # Register the configured model from review_llm section so the review pipeline
         # uses the correct model/endpoint (overrides fallback configs).
         register_config_section("review_llm")
         print(f"[review] Available AutoReview models:")

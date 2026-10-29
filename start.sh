@@ -1,5 +1,5 @@
 #!/bin/bash
-# 🦞 龙虾 Agent 军团 — 一键启动/停止
+# 🔬 EMNETS-RA — 一键启动/停止
 # Usage: ./start.sh [start|stop|restart|status|reset-state|fresh]
 #
 # reset-state — 清空流水线持久化数据（项目、队列、Idea 工厂产出、共享知识库索引）
@@ -7,6 +7,7 @@
 # fresh       — stop → reset-state → start（全新从头跑）
 
 BASE="$(cd "$(dirname "$0")" && pwd)"
+. "$BASE/scripts/load-provider-env.sh"
 FE="$BASE/frontend"
 LOG="$BASE/logs"
 PIDF="$BASE/.pids"
@@ -40,15 +41,15 @@ fi
 [ -n "$_saved_ab" ] && AGENT_BRIDGE_PORT="$_saved_ab"
 [ -n "$_saved_fe" ] && FRONTEND_PORT="$_saved_fe"
 
-# 与本机其他 Claw-AI-Lab / PyramidResearchTeam 副本冲突时，可覆盖端口，例如:
+# 与本机其他 EMNETS-RA / Claw-AI-Lab 副本冲突时，可覆盖端口，例如:
 #   RESOURCE_MONITOR_PORT=8915 AGENT_BRIDGE_PORT=8916 FRONTEND_PORT=5913 ./start.sh
 RESOURCE_MONITOR_PORT="${RESOURCE_MONITOR_PORT:-8905}"
 AGENT_BRIDGE_PORT="${AGENT_BRIDGE_PORT:-8906}"
 FRONTEND_PORT="${FRONTEND_PORT:-5903}"
 export RESOURCE_MONITOR_PORT AGENT_BRIDGE_PORT
 
-# API key is read from config yaml (llm.api_key) by agent_bridge at runtime.
-# Set RESEARCHCLAW_API_KEY env var only if you want to override the config value.
+# Provider keys are read from the private environment loaded above.
+# Legacy RESEARCHCLAW_API_KEY remains available for older configurations.
 export RESEARCHCLAW_API_KEY="${RESEARCHCLAW_API_KEY:-}"
 
 FNM_DIR="${FNM_DIR:-$HOME/.local/share/fnm}"
@@ -121,7 +122,7 @@ PYEOF
 }
 
 do_start() {
-    echo "🦞 启动龙虾 Agent 军团..."
+    echo "🔬 启动 EMNETS-RA..."
     echo ""
 
     # 1) Resource Monitor
@@ -146,7 +147,7 @@ do_start() {
             --pool-idea 3 --pool-exp 2 --pool-code 3 --pool-exec 4 --pool-write 2 \
             --total-gpus 8 --gpus-per-project 1 \
             --discussion-mode --discussion-rounds 2 \
-            --discussion-models "Qwen3.5-122B-A10B-FP8" \
+            --discussion-models "Qwen3.8-27B-FP8" \
             ${AUTO_LOOP:+--auto-loop} \
             ${IDEA_COUNT:+--idea-count $IDEA_COUNT} \
             ${IDEA_TOPIC:+--idea-topic "$IDEA_TOPIC"} \

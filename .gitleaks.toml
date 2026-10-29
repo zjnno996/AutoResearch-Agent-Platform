@@ -1,0 +1,28 @@
+title = "EMNETS-RA publication secret checks"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed bibliography identifiers, not provider credentials"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)backend/agent/(researchclaw/data/seminal_papers\.yaml|tests/test_rc_citation_verify\.py)$''']
+regexTarget = "secret"
+regexes = ['''^(?:agibot2025world|ba2016layer|black2023susie|black2024pi0|brohan2023rt2|cen2025worldvla|chen2018neural|chen2020simple|chi2023diffusion_policy|devlin2019bert|dosovitskiy2021image|dreamdojo2026|du2023unipi|fakepaper2025hallucinated|finn2017model|frazier2018tutorial|gigaworld2026|goodfellow2014generative|gulrajani2021search|haarnoja2018soft|hafner2023dreamerv3|he2016deep|he2016identity|hendrycks2019benchmarking|ho2020denoising|hpt2024|huang2023leo|huang2023voxposer|ioffe2015batch|kim2024openvla|kingma2014auto|kingma2015adam|kipf2017semi|kirkpatrick2017overcoming|lingbot2026va|liu2023libero|loshchilov2019decoupled|lowe2017multi|mees2022calvin|mnih2013playing|motus2025|nvidia2026cosmos_policy|nvidia2026dreamzero|octo2024|oxe2023|parisi2019continual|pi05_2025|reed2022gato|robotwin2024|saenko2010adapting|schulman2017proximal|smith2024test|srivastava2014dropout|sutskever2013importance|ulyanov2016instance|uwm2025|vaswani2017attention|world2act2026|worldarena2026|wu2018group|wu2024gr1|zhao2025cotvla|zhen20243dvla|zhen2025xvla|zhou2024robodreamer|zhu2023minigpt4)$''']
+
+[[allowlists]]
+description = "SHA256 file integrity digests in the pinned skills manifest"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)backend/agent/researchclaw/skills/sources\.lock\.json$''']
+regexTarget = "secret"
+regexes = ['''^[a-f0-9]{64}$''']
+
+[[allowlists]]
+description = "Literal YOUR_TOKEN placeholder in the upstream NOAA curl examples"
+targetRules = ["curl-auth-header"]
+condition = "AND"
+paths = ['''(^|/)backend/agent/researchclaw/skills/library/scientific/database-lookup/references/noaa\.md$''']
+regexTarget = "match"
+regexes = ['''(?i)token:\s*YOUR_TOKEN''']

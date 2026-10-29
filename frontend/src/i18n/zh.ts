@@ -1,6 +1,6 @@
 const zh: Record<string, string> = {
   // Header
-  'header.title': 'Claw AI Lab',
+  'header.title': 'EMNETS-RA · emnets科研助手',
   'header.mock_to_real': '🎭 模拟 → 切换真实',
   'header.real_to_mock': '🔌 真实 → 切换模拟',
   'header.agent_label': 'Agent:',

@@ -164,6 +164,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     kb_root_path = None
     config = RCConfig.load(config_path, check_paths=False)
+    if getattr(args, "workflow", None):
+        from dataclasses import replace
+        config = replace(config, research_engine=replace(config.research_engine, workflow=args.workflow))
 
     # Override graceful_degradation if CLI flag is set
     if no_graceful_degradation:
@@ -282,7 +285,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     done = sum(1 for r in results if r.status.value == "done")
-    failed = sum(1 for r in results if r.status.value == "failed")
+    latest = {r.stage: r for r in results}
+    failed = sum(1 for r in latest.values() if r.status.value == "failed")
     print(f"\nPipeline complete: {done}/{len(results)} stages done, {failed} failed")
     return 0 if failed == 0 else 1
 
@@ -508,18 +512,19 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="researchclaw",
-        description="ResearchClaw — Autonomous Research Pipeline",
+        prog="emnets-ra",
+        description="EMNETS-RA — EMNETS Research Assistant (ResearchClaw runtime)",
     )
     sub = parser.add_subparsers(dest="command")
 
-    run_p = sub.add_parser("run", help="Run the 26-stage research pipeline")
+    run_p = sub.add_parser("run", help="Run the configured research workflow")
     _ = run_p.add_argument("--topic", "-t", help="Override research topic")
     _ = run_p.add_argument(
         "--config", "-c", default=None,
         help="Config file (default: auto-detect config.arc.yaml or config.yaml)",
     )
     _ = run_p.add_argument("--output", "-o", help="Output directory")
+    _ = run_p.add_argument("--workflow", choices=("compact", "legacy"), help="Six-phase workflow or historical 26-stage workflow")
     _ = run_p.add_argument(
         "--from-stage", help="Start from a specific stage (e.g. TOPIC_INIT)"
     )
@@ -571,6 +576,42 @@ def main(argv: list[str] | None = None) -> int:
         "--run-dir", required=True, help="Path to run artifacts directory"
     )
     _ = rpt_p.add_argument("--output", "-o", help="Write report to file")
+
+    skills_p = sub.add_parser("skills", help="List or select installed scientific skills")
+    _ = skills_p.add_argument("--stage", type=int, choices=range(1, 27))
+    _ = skills_p.add_argument("--topic", default="")
+    _ = skills_p.add_argument("--limit", type=int, default=3)
+    _ = skills_p.add_argument("--verify", action="store_true", help="Verify all pinned skill hashes")
+    plan_p = sub.add_parser("plan", help="Inspect research methods and stage dependencies without model calls")
+    _ = plan_p.add_argument("--config", "-c")
+    _ = plan_p.add_argument("--from-stage", type=int, choices=range(1, 27), default=1)
+    _ = plan_p.add_argument("--to-stage", type=int, choices=range(1, 27), default=26)
+    _ = plan_p.add_argument("--output", "-o")
+    compare_p = sub.add_parser("compare-runs", help="Compare research quality before token/time efficiency")
+    _ = compare_p.add_argument("--baseline", required=True)
+    _ = compare_p.add_argument("--candidate", required=True)
+    _ = compare_p.add_argument("--output", required=True)
+    rcb = sub.add_parser("rcbench", help="Prepare, run and score EMNETS-RA with official ResearchClawBench")
+    rcb_sub = rcb.add_subparsers(dest="rcbench_command", required=True)
+    for name in ("doctor", "register", "prepare", "score", "summary", "agent", "batch"):
+        command_parser = rcb_sub.add_parser(name)
+        if name != "agent":
+            _ = command_parser.add_argument("--repo", required=True, type=Path)
+        if name in ("doctor", "register", "prepare", "agent", "batch"):
+            _ = command_parser.add_argument("--config", "-c", required=True, type=Path)
+        if name in ("doctor", "prepare"):
+            _ = command_parser.add_argument("--task", required=name == "prepare")
+        if name in ("agent", "score"):
+            _ = command_parser.add_argument("--workspace", "-w", required=True, type=Path)
+        if name == "agent":
+            _ = command_parser.add_argument("--prompt")
+            _ = command_parser.add_argument('--resume', action='store_true', help='Resume an unchanged, unscored transport-failed attempt without resetting its budget')
+        if name in ("doctor", "score", "batch"):
+            _ = command_parser.add_argument("--judge-env", type=Path)
+        if name == "batch":
+            _ = command_parser.add_argument("--task", action="append", required=True)
+            _ = command_parser.add_argument("--repeats", type=int, default=1)
+            _ = command_parser.add_argument("--timeout", type=int, default=2400)
     args = parser.parse_args(argv)
 
     command = cast(str | None, args.command)
@@ -587,6 +628,76 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_setup(args)
     elif command == "report":
         return cmd_report(args)
+    elif command == "skills":
+        import json
+        from researchclaw.skills import SkillRegistry
+        registry = SkillRegistry()
+        if args.verify:
+            verification = registry.verify()
+            print(json.dumps(verification, ensure_ascii=False, indent=2))
+            return 0 if verification["ok"] else 1
+        catalog = registry.catalog()
+        if args.stage:
+            selected = {str(skill.path) for skill in registry.select(args.stage, args.topic, limit=max(1, args.limit))}
+            catalog = [row for row in catalog if row["path"] in selected]
+        print(json.dumps({"installed": len(registry.skills), "skills": catalog}, ensure_ascii=False, indent=2))
+        return 0
+    elif command == "plan":
+        import json
+        from researchclaw.orchestration.methods import method_plan
+        from researchclaw.orchestration.artifacts import write_json
+        from researchclaw.pipeline.graph import StageGraph
+        from researchclaw.pipeline.builtins import default_registry
+        from researchclaw.pipeline.stages import Stage
+        resolved = _resolve_config_or_exit(args)
+        if resolved is None:
+            return 1
+        try:
+            config = RCConfig.load(resolved, check_paths=False)
+            report = {"execution": StageGraph().describe(Stage(args.from_stage), Stage(args.to_stage)),
+                      "methods": method_plan(config), "engine_enabled": config.research_engine.enabled}
+            report["implementations"] = default_registry().describe()
+            if args.output:
+                write_json(Path(args.output), report)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        except ValueError as exc:
+            print(f"Invalid execution plan: {exc}", file=sys.stderr)
+            return 1
+    elif command == "compare-runs":
+        import json
+        from researchclaw.orchestration.assessment import compare_runs
+        report = compare_runs(Path(args.baseline), Path(args.candidate), Path(args.output))
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["approve_efficiency_profile"] else 1
+    elif command == "rcbench":
+        import json
+        from researchclaw.benchmarks import rcbench
+        try:
+            if getattr(args, "judge_env", None):
+                from dotenv import load_dotenv
+                load_dotenv(args.judge_env, override=False)
+            if args.rcbench_command == "doctor":
+                report = rcbench.doctor(args.repo, args.config, args.task)
+            elif args.rcbench_command == "register":
+                report = rcbench.register(args.repo, args.config)
+            elif args.rcbench_command == "prepare":
+                report = {"workspace": str(rcbench.prepare(args.repo, args.task, args.config)), "status": "prepared"}
+            elif args.rcbench_command == "agent":
+                return rcbench.run_agent(args.workspace, args.config, args.prompt, resume=args.resume)
+            elif args.rcbench_command == "score":
+                report = rcbench.score(args.repo, args.workspace)
+            elif args.rcbench_command == "batch":
+                report = rcbench.batch(args.repo, args.config, args.task, repeats=args.repeats, timeout=args.timeout)
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0 if all(row["status"] == "scored" for row in report["attempts"]) else 1
+            else:
+                report = rcbench.summary(args.repo)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        except (ValueError, OSError, ImportError) as exc:
+            print(f"ResearchClawBench: {exc}", file=sys.stderr)
+            return 1
     else:
         parser.print_help()
         return 0

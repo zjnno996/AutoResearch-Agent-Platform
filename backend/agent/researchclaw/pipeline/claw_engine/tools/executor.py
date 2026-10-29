@@ -10,11 +10,16 @@ workspace root and validated by the permission policy before execution.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
+import time
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +27,16 @@ logger = logging.getLogger(__name__)
 
 MAX_RESULT_CHARS = 16000
 MAX_BASH_RESULT_CHARS = 24000
+
+
+@dataclass(frozen=True)
+class ToolOutcome:
+    content: str
+    is_error: bool = False
+    error_code: str = ""
+    exit_code: int | None = None
+    timed_out: bool = False
+    duration_sec: float = 0.0
 
 
 class ToolExecutor:
@@ -37,6 +52,7 @@ class ToolExecutor:
         allowed_read_dirs: list[Path] | None = None,
         bash_timeout: int = 60,
         python_path: str = "",
+        journal_path: Path | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.allowed_read_dirs = [
@@ -46,41 +62,95 @@ class ToolExecutor:
         self.python_path = python_path
         self.call_count = 0
         self._snapshot_count = 0
+        self.journal_path = journal_path
 
     def execute(self, name: str, input_data: dict[str, Any]) -> tuple[str, bool]:
-        """Execute a tool call. Returns (result_string, is_error)."""
+        """Compatibility interface. Errors retain their structured meaning."""
+        outcome = self.execute_structured(name, input_data)
+        return outcome.content, outcome.is_error
+
+    @staticmethod
+    def validate_input(name: str, inp: Any) -> None:
+        if not isinstance(inp, dict) or "_invalid_arguments" in inp:
+            raise ValueError("Tool arguments must be a valid JSON object")
+        required = {"bash": ("command",), "read_file": ("path",),
+                    "write_file": ("path", "content"), "edit_file": ("path", "old_string", "new_string"),
+                    "glob_search": ("pattern",), "grep_search": ("pattern",)}
+        for key in required.get(name, ()):
+            if not isinstance(inp.get(key), str) or (key in ("path", "command", "pattern", "old_string") and not inp[key]):
+                raise ValueError(f"{key} must be {'a nonempty ' if key != 'content' else 'a '}string")
+        for key in ("offset", "limit", "context"):
+            if key in inp and (type(inp[key]) is not int or inp[key] < 0):
+                raise ValueError(f"{key} must be a nonnegative integer")
+        if "timeout" in inp and (type(inp["timeout"]) not in (int, float) or not 0 < inp["timeout"] < float("inf")):
+            raise ValueError("timeout must be a positive finite number")
+
+    def execute_structured(self, name: str, input_data: dict[str, Any]) -> ToolOutcome:
+        started = time.monotonic()
+        outcome = self._dispatch(name, input_data)
+        outcome = replace(outcome, duration_sec=round(time.monotonic() - started, 4))
+        self._record_outcome(name, input_data, outcome)
+        return outcome
+
+    def _dispatch(self, name: str, input_data: dict[str, Any]) -> ToolOutcome:
         self.call_count += 1
         try:
+            self.validate_input(name, input_data)
             if name == "bash":
-                return self._bash(input_data), False
+                return self._bash_outcome(input_data)
             elif name == "read_file":
-                return self._read_file(input_data), False
+                return ToolOutcome(self._read_file(input_data))
             elif name == "write_file":
                 result = self._write_file(input_data)
                 self._save_snapshot(input_data.get("path", ""))
-                return result, False
+                return ToolOutcome(result)
             elif name == "edit_file":
                 result = self._edit_file(input_data)
                 self._save_snapshot(input_data.get("path", ""))
-                return result, False
+                return ToolOutcome(result)
             elif name == "glob_search":
-                return self._glob_search(input_data), False
+                return ToolOutcome(self._glob_search(input_data))
             elif name == "grep_search":
-                return self._grep_search(input_data), False
+                return ToolOutcome(self._grep_search(input_data))
             else:
-                return f"Unknown tool: {name}", True
+                return ToolOutcome(f"Unknown tool: {name}", True, "unknown_tool")
         except PermissionError as e:
-            return f"Permission denied: {e}", True
+            return ToolOutcome(f"Permission denied: {e}", True, "permission_denied")
         except FileNotFoundError as e:
-            return f"File not found: {e}", True
+            return ToolOutcome(f"File not found: {e}", True, "file_not_found")
+        except (ValueError, KeyError, TypeError) as e:
+            return ToolOutcome(f"Invalid tool input: {e}", True, "invalid_input")
         except Exception as e:
-            return f"Tool error ({type(e).__name__}): {e}", True
+            return ToolOutcome(f"Tool error ({type(e).__name__}): {e}", True, "execution_error")
+
+    def _record_outcome(self, name: str, inp: Any, outcome: ToolOutcome) -> None:
+        if self.journal_path is None:
+            return
+        import fcntl
+        row = {key: value for key, value in asdict(outcome).items() if key != "content"}
+        row.update(schema_version="harness-tool-event-v1", tool=name,
+                   timestamp=datetime.now(timezone.utc).isoformat(), workspace=str(self.workspace),
+                   input_sha256=hashlib.sha256(json.dumps(inp, sort_keys=True, default=str).encode()).hexdigest(),
+                   output_sha256=hashlib.sha256(outcome.content.encode()).hexdigest(),
+                   output_chars=len(outcome.content))
+        try:
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.journal_path.open("a", encoding="utf-8") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                handle.write(json.dumps(row) + "\n")
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            logger.exception("Could not persist tool execution event")
 
     # ------------------------------------------------------------------
     # bash — ported from claw-code runtime/src/bash.rs
     # ------------------------------------------------------------------
 
     def _bash(self, inp: dict[str, Any]) -> str:
+        """Legacy direct-call interface; dispatch uses the full outcome."""
+        return self._bash_outcome(inp).content
+
+    def _bash_outcome(self, inp: dict[str, Any]) -> ToolOutcome:
         command = inp.get("command", "")
         if not command:
             raise ValueError("command is required")
@@ -103,28 +173,55 @@ class ToolExecutor:
             env["CONDA_PREFIX"] = env_prefix
             env["VIRTUAL_ENV"] = env_prefix
 
-        try:
-            # Use bash -c (not -lc) to avoid login shell resetting PATH
-            result = subprocess.run(
+        # A new process group lets timeouts clean up this invocation's children.
+        # bash -c preserves the configured Python environment.
+        with subprocess.Popen(
                 ["bash", "-c", command],
                 cwd=str(self.workspace),
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
-            )
+                errors="replace",
+                start_new_session=True,
+        ) as process:
+            timed_out = False
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self._signal_group(process, signal.SIGTERM)
+                try:
+                    stdout, stderr = process.communicate(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    self._signal_group(process, signal.SIGKILL)
+                    stdout, stderr = process.communicate(timeout=2)
+                finally:
+                    self._signal_group(process, signal.SIGKILL)
+            except BaseException:
+                self._signal_group(process, signal.SIGKILL)
+                process.wait()
+                raise
             output_parts = []
-            if result.stdout:
-                output_parts.append(result.stdout)
-            if result.stderr:
-                output_parts.append(f"[stderr]\n{result.stderr}")
-            if result.returncode != 0:
-                output_parts.append(f"[exit_code: {result.returncode}]")
+            if stdout:
+                output_parts.append(stdout)
+            if stderr:
+                output_parts.append(f"[stderr]\n{stderr}")
+            if timed_out:
+                output_parts.append(f"Command timed out after {timeout}s: {command[:100]}")
+            if process.returncode != 0:
+                output_parts.append(f"[exit_code: {process.returncode}]")
             output = "\n".join(output_parts) or "(no output)"
-        except subprocess.TimeoutExpired:
-            output = f"Command timed out after {timeout}s: {command[:100]}"
+        return ToolOutcome(self._truncate_bash(output), timed_out or process.returncode != 0,
+                           "timeout" if timed_out else "nonzero_exit" if process.returncode else "",
+                           process.returncode, timed_out)
 
-        return self._truncate_bash(output)
+    @staticmethod
+    def _signal_group(process: subprocess.Popen, sig: int) -> None:
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
 
     # ------------------------------------------------------------------
     # read_file — ported from claw-code runtime/src/file_ops.rs
@@ -186,7 +283,7 @@ class ToolExecutor:
         text = path.read_text(encoding="utf-8")
         if old_string not in text:
             snippet = old_string[:100].replace("\n", "\\n")
-            return f"old_string not found in {path.name}: '{snippet}...'"
+            raise ValueError(f"old_string not found in {path.name}: '{snippet}...'")
 
         if replace_all:
             count = text.count(old_string)
@@ -215,7 +312,7 @@ class ToolExecutor:
         return_relative = base == self.workspace
 
         if not base.is_dir():
-            return f"Not a directory: {base}"
+            raise ValueError(f"Not a directory: {base}")
 
         is_recursive = "**" in pattern
         matches: list[tuple[float, Path]] = []
@@ -281,7 +378,7 @@ class ToolExecutor:
         try:
             regex = re.compile(pattern_str, re.IGNORECASE)
         except re.error as e:
-            return f"Invalid regex: {e}"
+            raise ValueError(f"Invalid regex: {e}") from e
 
         if base.is_file():
             files = [base]

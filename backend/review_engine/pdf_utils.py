@@ -341,6 +341,17 @@ def _extract_pdf_text(raw: bytes) -> str:
     """
     results: dict[str, str] = {}
 
+    def _try_pymupdf():
+        try:
+            try:
+                import pymupdf
+            except ImportError:
+                import fitz as pymupdf
+            with pymupdf.open(stream=raw, filetype="pdf") as document:
+                results["pymupdf"] = "\n".join(page.get_text() for page in document)
+        except Exception:
+            pass
+
     def _try_pypdf2():
         try:
             import PyPDF2
@@ -358,7 +369,8 @@ def _extract_pdf_text(raw: bytes) -> str:
         except Exception:
             pass
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pool.submit(_try_pymupdf)
         pool.submit(_try_pypdf2)
         pool.submit(_try_pdfminer)
 

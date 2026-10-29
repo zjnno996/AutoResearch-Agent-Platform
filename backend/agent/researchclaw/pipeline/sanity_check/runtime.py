@@ -54,7 +54,7 @@ class SanityCheckRuntime:
         *,
         llm: Any | None = None,
     ) -> Any:
-        from researchclaw.pipeline.executor import StageResult
+        from researchclaw.pipeline.models import StageResult
 
         stage_dir.mkdir(parents=True, exist_ok=True)
         session = StageSession(stage_dir=stage_dir, stage_name="sanity_check")

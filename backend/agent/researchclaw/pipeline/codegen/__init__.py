@@ -19,7 +19,7 @@ from typing import Any
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.pipeline.codegen.runtime import CodegenRuntime
-from researchclaw.pipeline.executor import StageResult
+from researchclaw.pipeline.models import StageResult
 
 
 def execute_code_generation(

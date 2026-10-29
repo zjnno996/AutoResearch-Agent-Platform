@@ -13,19 +13,19 @@ Tools are NOT embedded here — they go via the API ``tools`` field.
 from __future__ import annotations
 
 from pathlib import Path
+from contextvars import ContextVar
 from typing import Any
 
 from researchclaw.pipeline.codegen.types import CodegenContext
 
 DYNAMIC_BOUNDARY = "────────────────────────────────────────"
 
-_workspace_path: str = ""
+_workspace_path: ContextVar[str] = ContextVar("codegen_workspace_path", default="")
 
 
 def set_workspace_path(path: str) -> None:
     """Set the actual workspace path so the system prompt can include it."""
-    global _workspace_path
-    _workspace_path = path
+    _workspace_path.set(path)
 
 
 def _plan_dict(ctx: CodegenContext) -> dict[str, Any]:
@@ -48,30 +48,8 @@ def _requested_seeds(ctx: CodegenContext) -> list[int]:
 
 def _requires_pretrained_model(ctx: CodegenContext) -> bool:
     """Whether the executable plan actually calls for a pretrained model."""
-    if ctx.checkpoints_dir:
-        return True
-    import json
-
-    parsed = _plan_dict(ctx)
-    proposed = parsed.get("proposed_methods", [])
-    baselines = parsed.get("baselines", [])
-    executable = json.dumps(
-        {"proposed_methods": proposed, "baselines": baselines},
-        ensure_ascii=False,
-    ).lower()
-    pretrained_tokens = (
-        "pretrained", "from_pretrained", "checkpoint", "diffusion", "transformer",
-        "resnet", "vit", "clip", "llm", "cnn", "lstm",
-    )
-    if any(token in executable for token in pretrained_tokens):
-        return True
-    classical_tokens = (
-        "sklearn", "sgdclassifier", "randomforestclassifier", "linear sgd",
-        "random forest", "随机森林",
-    )
-    if not proposed and any(token in executable for token in classical_tokens):
-        return False
-    return True
+    from researchclaw.pipeline.codegen.requirements import requires_pretrained_model
+    return requires_pretrained_model(_plan_dict(ctx), ctx.checkpoints_dir)
 
 
 def build_system_prompt(ctx: CodegenContext) -> str:
@@ -105,10 +83,11 @@ def build_user_message(ctx: CodegenContext) -> str:
   - Never replace a planned neural model with a toy nn.Linear or randomly initialized stand-in."""
         implementation_check = "model/checkpoint loading API"
     else:
-        implementation_guidance = """- This is a classical-ML plan: do NOT introduce a pretrained neural model.
-  - Implement exactly the estimators listed in EXPERIMENT_PLAN.yaml with their specified hyperparameters.
-  - Download/load the official dataset, use its official split, and never substitute synthetic data."""
-        implementation_check = "requested scikit-learn estimator APIs"
+        implementation_guidance = """- Implement the exact algorithms, equations, solvers or estimators in EXPERIMENT_PLAN.yaml.
+  - Use the libraries and numerical implementations appropriate to the research domain.
+  - Load the provided data and preserve its specified protocol; never substitute unrelated synthetic data.
+  - A pretrained neural model is required only when the executable plan explicitly calls for one."""
+        implementation_check = "requested algorithms and their domain-specific implementations"
     return f"""Generate a complete experiment for the following research topic.
 
 TOPIC: {ctx.topic}
@@ -245,28 +224,27 @@ def _anti_simulation_section(ctx: CodegenContext) -> str:
     if not _requires_pretrained_model(ctx):
         return """# ANTI-SIMULATION RULES (MANDATORY — VIOLATION = EXPERIMENT REJECTED)
 
-This plan requests classical machine-learning estimators, not a pretrained neural model.
-Use the exact requested production estimators (for example scikit-learn SGDClassifier
-and RandomForestClassifier) on the real dataset.
+Implement the algorithms and evidence required by the executable research plan.
 
 ## Forbidden Patterns (instant rejection)
- - Synthetic or randomly generated replacement data when the official dataset is required
- - `np.random.uniform` / `torch.rand` to generate fake metric values
- - Functions named `compute_*_mock` or `*_mock`
- - Any function that returns a hardcoded or random number as a metric
- - Writing plan metadata into outputs as if it were measured experimental output
- - Listing an estimator in outputs if it was not fitted and evaluated
+ - Returning hardcoded or random values as measured metrics
+ - Mock implementations replacing an executable scientific method
+ - Writing plan metadata into outputs as if it were an observed result
+ - Reporting a method or condition that was not actually executed
+ - Silently replacing the supplied dataset or numerical problem
 
 ## Required Patterns (must be present)
- - Download or load the official dataset and retain a verifiable source/data manifest
- - Fit and predict with each exact estimator requested by EXPERIMENT_PLAN.yaml
- - Compute metrics from true labels and predictions using a validated library
- - Retain per-seed raw results before computing summaries or statistical tests
+ - Load the provided data and retain source/version information
+ - Execute every planned algorithm, solver or estimator using appropriate libraries
+ - Compute requested metrics or numerical diagnostics from actual execution
+ - Retain raw observations before summarizing uncertainty or comparisons
+ - Keep numerical evidence separate from mathematical proof
  - Clearly distinguish measured results from skipped or unavailable results
 
 ## Self-Verification Protocol
-Verify that main.py imports and executes the requested estimator classes, reads real
-dataset files, and contains no mock functions or random metric generation."""
+Verify that main.py executes the requested domain-specific methods, reads the
+provided inputs, and contains no mock functions or random metric generation."""
+
 
     return """# ANTI-SIMULATION RULES (MANDATORY — VIOLATION = EXPERIMENT REJECTED)
 
@@ -317,7 +295,7 @@ If this finds mock functions or random metric generation, rewrite with real impl
 
 def _environment_section(ctx: CodegenContext) -> str:
     lines = ["# Environment"]
-    ws = _workspace_path or str(ctx.stage_dir or "workspace")
+    ws = _workspace_path.get() or str(ctx.stage_dir or "workspace")
     lines.append(f" - Working directory: `{ws}`")
     lines.append(f" - IMPORTANT: Use RELATIVE paths for write_file (e.g. `main.py`, NOT `/workspace/main.py`)")
     lines.append(f"   All write_file/edit_file calls use the working directory as base.")

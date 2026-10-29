@@ -121,16 +121,9 @@ def _classify_error(stage_name: str, error_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Stage name mapping (import-free to avoid circular deps)
-_STAGE_NAMES: dict[int, str] = {
-    1: "topic_init", 2: "problem_decompose", 3: "search_strategy",
-    4: "literature_collect", 5: "literature_screen", 6: "knowledge_extract",
-    7: "synthesis", 8: "hypothesis_gen", 9: "experiment_design",
-    10: "code_generation", 11: "resource_planning", 12: "experiment_run",
-    13: "iterative_refine", 14: "result_analysis", 15: "research_decision",
-    16: "paper_outline", 17: "paper_draft", 18: "peer_review",
-    19: "paper_revision", 20: "quality_gate", 21: "knowledge_archive",
-    22: "export_publish", 23: "citation_verify",
-}
+from researchclaw.pipeline.stages import Stage
+
+_STAGE_NAMES: dict[int, str] = {int(stage): stage.name.lower() for stage in Stage}
 
 
 def extract_lessons(
@@ -214,7 +207,9 @@ def _extract_decision_rationale(run_dir: Path) -> str:
     - ``rationale`` or ``reason`` key (direct)
     - ``raw_text_excerpt`` containing ``## Justification`` section (LLM output)
     """
-    for stage_dir in sorted(run_dir.glob("stage-15*"), reverse=True):
+    candidates = [run_dir / "stage-17", *sorted(run_dir.glob("stage-17_v*"), reverse=True),
+                  run_dir / "stage-15"]  # Legacy run compatibility.
+    for stage_dir in candidates:
         decision_file = stage_dir / "decision_structured.json"
         if decision_file.exists():
             try:

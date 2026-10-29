@@ -1,6 +1,6 @@
 const en: Record<string, string> = {
   // Header
-  'header.title': 'Claw AI Lab',
+  'header.title': 'EMNETS-RA',
   'header.mock_to_real': '🎭 Mock → Switch to Real',
   'header.real_to_mock': '🔌 Real → Switch to Mock',
   'header.agent_label': 'Agent:',

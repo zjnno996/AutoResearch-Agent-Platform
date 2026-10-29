@@ -113,6 +113,7 @@ class ClawAgentStrategy:
             bash_timeout=120,  # S11 verifies via import + smoke mode; full experiment remains the default code path
             max_iterations=40,
             python_path=python_path,
+            checkpoints_dir=ctx.checkpoints_dir,
         )
 
         loop.set_exp_plan(ctx.exp_plan)
@@ -137,8 +138,6 @@ class ClawAgentStrategy:
                 encoding="utf-8",
             )
             session.add_artifact("claw_agent_log.json")
-
-        session.llm_calls += turn_result.tool_calls
 
         if turn_result.files and "main.py" in turn_result.files:
             session.log(

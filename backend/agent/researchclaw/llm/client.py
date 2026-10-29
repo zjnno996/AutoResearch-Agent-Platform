@@ -12,13 +12,14 @@ Features:
 from __future__ import annotations
 
 import json
+import http.client
 import logging
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from ipaddress import ip_address
 from typing import Any
 
@@ -71,9 +72,12 @@ class LLMConfig:
 
     base_url: str
     api_key: str
-    primary_model: str = "Qwen3.5-122B-A10B-FP8"
+    primary_model: str = "Qwen3.8-27B-FP8"
     fallback_models: list[str] = field(default_factory=list)
     max_tokens: int = 4096
+    # Optional reserve when a stage requests a smaller visible answer budget.
+    # Reasoning providers charge hidden reasoning against max_tokens as well.
+    reasoning_token_reserve: int = 0
     temperature: float = 0.7
     max_retries: int = 5
     retry_base_delay: float = 3.0
@@ -95,8 +99,10 @@ class LLMClient:
     """Stateless OpenAI-compatible chat completion client."""
 
     def __init__(self, config: LLMConfig) -> None:
-        self.config = config
-        self._model_chain = [config.primary_model] + list(config.fallback_models)
+        from researchclaw.llm.provider_policy import apply_provider_policy, provider_lock_enabled
+        self.config = apply_provider_policy(config)
+        self._provider_locked = provider_lock_enabled()
+        self._model_chain = [self.config.primary_model] + list(self.config.fallback_models)
         self._anthropic = None  # Will be set by from_rc_config if needed
 
     @classmethod
@@ -137,8 +143,10 @@ class LLMClient:
         config = LLMConfig(
             base_url=base_url,
             api_key=api_key,
-            primary_model=rc_config.llm.primary_model or "Qwen3.5-122B-A10B-FP8",
+            primary_model=rc_config.llm.primary_model or "Qwen3.8-27B-FP8",
             fallback_models=list(rc_config.llm.fallback_models or []),
+            max_tokens=getattr(rc_config.llm, "max_tokens", 4096),
+            reasoning_token_reserve=getattr(rc_config.llm, "reasoning_token_reserve", 0),
             timeout_sec=getattr(rc_config.llm, "timeout_sec", 600),
             max_retries=getattr(rc_config.llm, "max_retries", 5),
             retry_base_delay=getattr(rc_config.llm, "retry_base_delay", 3.0),
@@ -151,7 +159,7 @@ class LLMClient:
 
         # Detect Anthropic provider — use original URL/key (not the
         # MetaClaw proxy URL which is OpenAI-compatible only).
-        if provider == "anthropic":
+        if provider == "anthropic" and not client._provider_locked:
             from .anthropic_adapter import AnthropicAdapter
 
             client._anthropic = AnthropicAdapter(
@@ -188,11 +196,20 @@ class LLMClient:
         Returns:
             LLMResponse with content and metadata.
         """
+        from researchclaw.orchestration.context import augment_system
+        system = augment_system(system)
         if system:
             messages = [{"role": "system", "content": system}] + messages
 
-        models = [model] if model else self._model_chain
+        models = ([self.config.primary_model] if self._provider_locked
+                  else [model] if model else self._model_chain)
         max_tok = max_tokens or self.config.max_tokens
+        from researchclaw.llm.provider_policy import unlimited_tokens_enabled
+        if unlimited_tokens_enabled():
+            max_tok = self.config.max_tokens
+        if max_tokens is not None and self.config.reasoning_token_reserve:
+            max_tok = max(max_tok, min(self.config.max_tokens,
+                                      max_tok + self.config.reasoning_token_reserve))
         temp = temperature if temperature is not None else self.config.temperature
 
         last_error: Exception | None = None
@@ -238,8 +255,12 @@ class LLMClient:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+                from researchclaw.observability.tracing import provider_activity
+                provider_activity("completed", finish_reason=resp.finish_reason)
                 return resp
             except Exception as exc:  # noqa: BLE001
+                from researchclaw.observability.tracing import provider_activity
+                provider_activity("error", error_type=type(exc).__name__)
                 try:
                     from researchclaw.observability.tracing import trace_llm_call
                     trace_llm_call(
@@ -331,18 +352,16 @@ class LLMClient:
         json_mode: bool,
     ) -> LLMResponse:
         """Call with exponential backoff retry."""
+        request_client = self
         for attempt in range(self.config.max_retries):
             try:
-                return self._raw_call(
+                return request_client._raw_call(
                     model, messages, max_tokens, temperature, json_mode
                 )
             except urllib.error.HTTPError as e:
                 status = e.code
-                body = ""
-                try:
-                    body = e.read().decode()[:500]
-                except Exception:  # noqa: BLE001
-                    pass
+                from researchclaw.llm.errors import capture_provider_error
+                body = capture_provider_error(e, (self.config.api_key, self.config.fallback_api_key))
 
                 # Non-retryable errors
                 if status == 403 and "not allowed to use model" in body:
@@ -366,6 +385,7 @@ class LLMClient:
                 # 529 (Anthropic overloaded)
                 if status in (400, 429, 500, 502, 503, 504, 529):
                     if attempt >= self.config.max_retries - 1:
+                        e.request_retries_exhausted = True
                         raise
                     delay = self.config.retry_base_delay * (2**attempt)
                     # Add jitter
@@ -384,8 +404,23 @@ class LLMClient:
                     continue
 
                 raise  # Other HTTP errors
-            except (urllib.error.URLError, OSError, ConnectionError) as e:
+            except (urllib.error.URLError, OSError, ConnectionError, http.client.IncompleteRead) as e:
+                from researchclaw.llm.retry import retryable_model_error
+                if not retryable_model_error(e):
+                    raise
                 if attempt < self.config.max_retries - 1:
+                    from researchclaw.llm.errors import GenerationDeadlineExceeded
+                    from researchclaw.llm.provider_policy import unlimited_tokens_enabled, quality_first_enabled
+                    template = request_client.config.extra_body.get('chat_template_kwargs', {})
+                    if (isinstance(e, GenerationDeadlineExceeded) and self._provider_locked
+                            and unlimited_tokens_enabled() and not quality_first_enabled() and model.startswith('Qwen3.8-')
+                            and template.get('enable_thinking') and template.get('reasoning_effort') == 'xhigh'):
+                        import copy
+                        request_client = copy.copy(self)
+                        extra = dict(self.config.extra_body)
+                        extra['chat_template_kwargs'] = {**template, 'reasoning_effort': 'medium'}
+                        request_client.config = replace(self.config, extra_body=extra)
+                        logger.warning('Qwen generation reached its request deadline; retrying this operation at native medium effort with unchanged token and scientific-validation policies')
                     import random
                     delay = self.config.retry_base_delay * (2 ** attempt)
                     delay += random.uniform(0, delay * 0.3)
@@ -395,6 +430,7 @@ class LLMClient:
                     )
                     time.sleep(delay)
                     continue
+                e.request_retries_exhausted = True
                 raise
 
         # Should not reach here, but just in case
@@ -422,33 +458,98 @@ class LLMClient:
     @classmethod
     def _stream_read(cls, req: urllib.request.Request, timeout: int) -> dict:
         """Send a streaming request and reassemble into a standard response dict."""
+        started = time.monotonic()
+        last_semantic_at = started
+        from researchclaw.llm.provider_policy import quality_first_enabled
+        quality_first = quality_first_enabled()
+        last_progress = 0.0
+        semantic_chars = 0
+        reasoning_chars = content_chars = 0
         with cls._urlopen(req, timeout=timeout) as resp:
+            # SSE permits data: with or without a space. Some gateways return
+            # ordinary JSON even when streaming was requested.
+            try:
+                lines = iter(resp)
+            except TypeError:
+                return json.loads(resp.read().decode("utf-8"))
             chunks: list[str] = []
             finish_reason = None
             model_name = ""
             usage = {}
-            for raw_line in resp:
+            plain: list[str] = []
+            received_bytes = 0
+            plain_bytes = 0
+            events = 0
+            for raw_line in lines:
+                observed_at = time.monotonic()
+                if observed_at - (last_semantic_at if quality_first else started) > timeout:
+                    from researchclaw.llm.errors import GenerationDeadlineExceeded
+                    if quality_first:
+                        raise TimeoutError("Provider stream exceeded the semantic inactivity timeout")
+                    raise GenerationDeadlineExceeded("Provider stream exceeded the configured request deadline")
+                received_bytes += len(raw_line)
                 line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line or not line.startswith("data: "):
+                if not line:
                     continue
-                payload = line[6:]
+                if not line.startswith("data:"):
+                    if plain_bytes < 262144:
+                        plain.append(line)
+                        plain_bytes += len(line)
+                    continue
+                payload = line[5:].lstrip()
                 if payload == "[DONE]":
                     break
                 try:
                     event = json.loads(payload)
                 except (json.JSONDecodeError, ValueError):
                     continue
+                if not isinstance(event, dict):
+                    continue
+                events += 1
+                if event.get("error"):
+                    return event
                 if not model_name:
                     model_name = event.get("model", "")
                 if event.get("usage"):
-                    usage = event["usage"]
+                    usage.update(event["usage"])
                 for choice in event.get("choices", []):
-                    delta = choice.get("delta", {})
+                    delta = choice.get("delta", choice.get("message", {}))
+                    increment = (len(delta.get("content") or "")
+                                 + len(delta.get("reasoning_content") or "")
+                                 + len(delta.get("reasoning") or ""))
+                    increment += len(json.dumps(delta.get("tool_calls") or [])) if delta.get("tool_calls") else 0
+                    semantic_chars += increment
+                    if increment:
+                        last_semantic_at = observed_at
+                    content_chars += len(delta.get('content') or '')
+                    reasoning_chars += len(delta.get('reasoning_content') or '') + len(delta.get('reasoning') or '')
+                    if increment and time.monotonic() - last_progress >= 5:
+                        from researchclaw.observability.tracing import provider_activity
+                        provider_activity("streaming", semantic_chars=semantic_chars, received_bytes=received_bytes,
+                                          reasoning_chars=reasoning_chars, content_chars=content_chars)
+                        last_progress = time.monotonic()
                     if delta.get("content"):
                         chunks.append(delta["content"])
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
             content = "".join(chunks)
+            if semantic_chars:
+                from researchclaw.observability.tracing import provider_activity
+                provider_activity('streaming', semantic_chars=semantic_chars, received_bytes=received_bytes,
+                                  reasoning_chars=reasoning_chars, content_chars=content_chars)
+            if not events and plain:
+                try:
+                    return json.loads("\n".join(plain))
+                except ValueError:
+                    pass
+            if not content and finish_reason != "length":
+                import io
+                details = {"error": {"code": "empty_stream", "message":
+                    f"No visible completion in provider response; events={events}, received_bytes={received_bytes}"}}
+                raise urllib.error.HTTPError(req.full_url, 502, "Empty model response", getattr(resp, "headers", {}),
+                                             io.BytesIO(json.dumps(details).encode()))
+            if content and not finish_reason:
+                finish_reason = "stream_interrupted"
             return {
                 "choices": [{"message": {"content": content, "role": "assistant"},
                              "finish_reason": finish_reason}],
@@ -580,10 +681,17 @@ class LLMClient:
             error_info = data["error"]
             error_msg = error_info.get("message", str(error_info))
             error_type = error_info.get("type", "api_error")
+            status = error_info.get("status", 500)
+            code = str(error_info.get("code", error_type))
+            status = {"invalid_api_key": 401, "insufficient_quota": 402, "permission_denied": 403,
+                      "model_not_found": 404, "rate_limit_exceeded": 429,
+                      "context_length_exceeded": 400, "invalid_request_error": 400}.get(code, status)
+            if type(status) is not int or not 400 <= status <= 599:
+                status = 500
             import io
             raise urllib.error.HTTPError(
-                "", 500, f"{error_type}: {error_msg}", {},
-                io.BytesIO(error_msg.encode()),
+                "", status, f"{error_type}: {error_msg}", {},
+                io.BytesIO(json.dumps({"error": error_info}).encode()),
             )
 
         # Extract text content from Responses API output format
@@ -629,6 +737,12 @@ class LLMClient:
         json_mode: bool,
     ) -> LLMResponse:
         """Make a single API call."""
+        from researchclaw.llm.budget import claim_model_call
+        claim_model_call()
+        from researchclaw.observability.tracing import provider_activity
+        provider_activity("started", model=model, max_tokens=max_tokens, timeout_sec=self.config.timeout_sec,
+                          reasoning_effort=self.config.extra_body.get('chat_template_kwargs', {}).get(
+                              'reasoning_effort', self.config.extra_body.get("reasoning_effort", "provider_default")))
 
         # Use Anthropic adapter if configured
         if self._anthropic:
@@ -684,11 +798,16 @@ class LLMClient:
                 else:
                     body["response_format"] = {"type": "json_object"}
 
-            for key, value in self.config.extra_body.items():
+            from researchclaw.llm.provider_policy import provider_request_options
+            for key, value in provider_request_options(self.config.extra_body).items():
                 if key not in {"model", "messages"}:
                     body[key] = value
 
+            from researchclaw.llm.provider_policy import apply_output_policy
+            apply_output_policy(body)
             body["stream"] = True
+            if self._provider_locked:
+                body.setdefault('stream_options', {'include_usage': True})
             request_body = json.loads(json.dumps(body))
             payload = json.dumps(body).encode("utf-8")
             url = self._join_endpoint(self.config.base_url, "/v1/chat/completions")
@@ -750,6 +869,10 @@ class LLMClient:
 
         message = choice.get("message", {})
         content = message.get("content") or ""
+        if not content and choice.get("finish_reason") != "length":
+            import io
+            raise urllib.error.HTTPError("", 502, "Empty model response", {},
+                io.BytesIO(b'{"error":{"code":"empty_response","message":"Provider returned no visible assistant completion"}}'))
 
         return LLMResponse(
             content=content,
@@ -758,7 +881,7 @@ class LLMClient:
             completion_tokens=usage.get("completion_tokens", 0),
             total_tokens=usage.get("total_tokens", 0),
             finish_reason=choice.get("finish_reason", ""),
-            truncated=(choice.get("finish_reason", "") == "length"),
+            truncated=(choice.get("finish_reason", "") in {"length", "stream_interrupted"}),
             raw=data,
             request=locals().get("request_body", {}),
         )
@@ -790,7 +913,7 @@ def create_client_from_yaml(yaml_path: str | None = None) -> LLMClient:
         LLMConfig(
             base_url=llm_section.get("base_url", "https://api.openai.com/v1"),
             api_key=api_key,
-            primary_model=llm_section.get("primary_model", "Qwen3.5-122B-A10B-FP8"),
+            primary_model=llm_section.get("primary_model", "Qwen3.8-27B-FP8"),
             fallback_models=llm_section.get(
                 "fallback_models", []
             ),

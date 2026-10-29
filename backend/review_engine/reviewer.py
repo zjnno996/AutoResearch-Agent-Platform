@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .scoring import review_totals, normalize_history_totals
+
 import base64
 import hashlib
 import json
@@ -60,7 +62,7 @@ from .pdf_utils import (
 ROOT_DIR = Path(__file__).resolve().parents[2]
 HISTORY_DIR = ROOT_DIR / "backend" / "review_history"
 CHECKPOINT_DIR = ROOT_DIR / "backend" / "review_cache" / "stages"
-REVIEW_CHECKPOINT_VERSION = "qwen-v8-claim-evidence-r1"
+REVIEW_CHECKPOINT_VERSION = "configured-v9-claim-evidence-r1"
 
 
 def _review_checkpoint_key(
@@ -890,11 +892,11 @@ class ReviewProgress:
 
     def get_complete_event(self) -> dict[str, Any]:
         results = self.completed
-        overall = sum(r["score"] for r in results) // len(results) if results else 0
+        overall, dimension_count = review_totals(results)
         return {
             "type": "complete",
             "overallScore": overall,
-            "dimensionCount": len(results),
+            "dimensionCount": dimension_count,
             "results": results,
         }
 
@@ -3075,14 +3077,14 @@ def run_review(
     """
     requested_model = None if model in ("default", "") else model
     model = get_preferred_review_model_name()
-    # AutoReview intentionally uses one Qwen model across visual extraction,
+    # AutoReview uses the configured review model across visual extraction,
     # review agents, evidence verification, debate, and final synthesis.
     models = None
 
     meta: dict[str, Any] = {
         "review_model": model,
         "requested_model": requested_model,
-        "model_policy": "qwen_only",
+        "model_policy": "configured_single_model",
     }
     paper_text = _get_paper_text(file_base64, file_name)
     raw = b""
@@ -3504,7 +3506,7 @@ def run_review(
     )
     _scored_results = [r for r in results if not r.get("diagnostic_only")]
     overall_score = (
-        sum(r["score"] for r in _scored_results) // len(_scored_results)
+        review_totals(_scored_results)[0]
         if _scored_results else 0
     )
     meta["reportSummary"] = _build_report_summary(
@@ -3547,11 +3549,11 @@ def run_review_streaming(
                 enable_debate=enable_debate, max_debates=max_debates,
                 min_finding_confidence=min_finding_confidence,
             )
-            overall = sum(r["score"] for r in results) // len(results) if results else 0
+            overall, dimension_count = review_totals(results)
             ev: dict[str, Any] = {
                 "type": "complete",
                 "overallScore": overall,
-                "dimensionCount": len(results),
+                "dimensionCount": dimension_count,
                 "results": results,
                 "meta": meta,
                 "keyFindings": meta.get("keyFindings", {"weaknesses": [], "suggestions": []}),
@@ -3614,7 +3616,7 @@ def _build_search_index() -> dict[str, Any]:
     for fpath in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
         try:
             with open(fpath, encoding="utf-8") as f:
-                data = json.load(f)
+                data = normalize_history_totals(json.load(f))
         except Exception:
             continue
         # Build searchable text from all fields
@@ -3692,14 +3694,14 @@ def save_review(
         datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         + "_" + uuid.uuid4().hex[:8]
     )
-    overall = sum(r["score"] for r in results) // len(results) if results else 0
+    overall, dimension_count = review_totals(results)
     record = {
         "id": review_id,
         "fileName": file_name,
         "model": model or get_primary_model_name(),
         "dimensions": dimensions,
         "overallScore": overall,
-        "dimensionCount": len(results),
+        "dimensionCount": dimension_count,
         "results": results,
         "meta": meta or {},
         "overallSummary": overall_summary,
@@ -3709,6 +3711,8 @@ def save_review(
     path = _review_history_path(review_id)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
+    global _SEARCH_INDEX
+    _SEARCH_INDEX = None
     return review_id
 
 
@@ -3719,7 +3723,7 @@ def load_review_history() -> list[dict[str, Any]]:
     for fpath in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
         try:
             with open(fpath, encoding="utf-8") as f:
-                data = json.load(f)
+                data = normalize_history_totals(json.load(f))
             records.append({
                 "id": data.get("id", fpath.stem),
                 "fileName": data.get("fileName", "Unknown"),
@@ -3835,7 +3839,7 @@ def load_review_by_id(review_id: str) -> dict[str, Any] | None:
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            return normalize_history_totals(json.load(f))
     except Exception:
         return None
 
@@ -3845,6 +3849,8 @@ def delete_review(review_id: str) -> bool:
     path = _review_history_path(review_id)
     if path.exists():
         path.unlink()
+        global _SEARCH_INDEX
+        _SEARCH_INDEX = None
         return True
     return False
 

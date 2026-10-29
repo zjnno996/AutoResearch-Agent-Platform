@@ -4,8 +4,9 @@ The LLM generates code by iteratively calling tools (bash, read_file,
 write_file, edit_file, glob_search, grep_search) in a turn loop —
 it writes code, runs it, reads errors, and fixes them autonomously.
 
-No separate validation/repair/review phases are needed because the
-agent handles all of that internally via tool calls.
+The tool loop performs local diagnostics and correction. The stage runtime
+and independent research verifier still check outputs and task requirements
+afterward; ending the tool loop does not establish scientific acceptance.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from researchclaw.pipeline.codegen.router import CodegenRouter
 from researchclaw.pipeline.codegen.session import CodegenSession
 from researchclaw.pipeline.codegen.strategies.fallback import FallbackStrategy
 from researchclaw.pipeline.codegen.types import CodegenContext, CodegenPhase, CodegenResult, DiscoveredData, HardwareProfile
-from researchclaw.pipeline.executor import StageResult, _utcnow_iso
+from researchclaw.pipeline.models import StageResult
+from researchclaw.pipeline.support.artifacts import _utcnow_iso
 from researchclaw.pipeline.stages import Stage, StageStatus
 
 logger = logging.getLogger(__name__)
@@ -467,12 +469,19 @@ class CodegenRuntime:
 
         # ── Phase 5: FALLBACK ────────────────────────────────────────────
         if not files or "main.py" not in files:
-            session.log(CodegenPhase.FALLBACK, "No main.py from strategy — using numpy fallback")
+            session.log(CodegenPhase.FALLBACK, "No main.py from strategy — checking task-compatible fallback")
             fallback = FallbackStrategy()
             fb_result = fallback.generate(ctx, config, llm, session, prompts=prompts)
             files = fb_result.files
             session.files = dict(files)
             session.strategy_used = f"{session.strategy_used}+fallback"
+            if "main.py" not in files:
+                message = fb_result.error or result.error or "No executable main.py was produced"
+                session.log_error(CodegenPhase.FALLBACK, message)
+                session.persist()
+                return StageResult(stage=Stage.CODE_GENERATION, status=StageStatus.FAILED,
+                    artifacts=("codegen_session.json", "codegen_live.log"),
+                    evidence_refs=("stage-11/codegen_session.json",), error=message)
 
         # Write experiment directory
         exp_dir = stage_dir / "experiment"
@@ -566,7 +575,7 @@ class CodegenRuntime:
         config: RCConfig, run_dir: Path, stage_dir: Path, session: CodegenSession,
     ) -> CodegenContext:
         from researchclaw.pipeline.codegen.types import DiscoveredData
-        from researchclaw.pipeline.executor import _load_hardware_profile, _read_prior_artifact
+        from researchclaw.pipeline.support.artifacts import _load_hardware_profile, _read_prior_artifact
 
         exp = config.experiment
         hw_raw = _load_hardware_profile(run_dir)

@@ -1,24 +1,30 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import LiteraturePanel from '../components/LiteraturePanel'
+import ResearchQualityPanel from '../components/ResearchQualityPanel'
 import type { PaperInfo } from '../components/LiteraturePanel'
 import { downloadMarkdown, printContentAsPdf } from '../export'
 import { useAuth } from '../contexts/AuthContext'
+import { useSearchParams } from 'react-router-dom'
 
 type ProjectStatus = 'running' | 'queued' | 'completed' | 'interrupted' | 'failed' | 'new'
 type RestartFrom = 'topic' | 'questions' | 'search' | 'literature' | 'evidence' | 'synthesis' | 'ideas' | 'experiment' | 'code' | 'run' | 'analysis' | 'writing' | 'finalization' | 'export'
 
 type ProjectInfo = {
+  runHealth?: { phase?: string; status?: string; observed_at?: number; phase_elapsed_sec?: number; request_elapsed_sec?: number; request_active?: boolean; provider_silence_sec?: number; semantic_chars?: number; model?: string }
   projectId: string
   status: ProjectStatus
   lastCompletedStage: number
   lastCompletedName: string
   firstStage: number
   totalStages: number
+  workflow?: 'compact' | 'legacy'
+  completedPhases?: string[]
   timestamp: string
   topic: string
   configPath: string
   intervention?: string
   runMode?: RunMode
+  deliveryFormat?: 'report' | 'ieee'
 }
 
 type Artifact = {
@@ -63,6 +69,7 @@ type LiteratureSchedule = {
 }
 
 type WSMessage =
+  | { type: 'research_progress'; payload: { projectId: string; health: ProjectInfo['runHealth'] } }
   | { type: 'artifact_produced'; payload: Artifact }
   | { type: 'project_list'; payload: ProjectInfo[] }
   | { type: 'chat_message'; payload: ChatMessage }
@@ -137,9 +144,9 @@ const RESTART_OPTIONS: Array<{ value: RestartFrom; label: string }> = [
   { value: 'export', label: '仅重新导出与归档' },
 ]
 const IDEA_COUNT_OPTIONS = [3, 5, 8]
-const DEFAULT_QWEN3_MODEL = 'Qwen3.5-122B-A10B-FP8'
+const DEFAULT_RESEARCH_MODEL = 'Qwen3.8-27B-FP8'
 const MODEL_OPTIONS = [
-  { value: DEFAULT_QWEN3_MODEL, label: 'Qwen3.5 122B 本地' },
+  { value: DEFAULT_RESEARCH_MODEL, label: DEFAULT_RESEARCH_MODEL },
 ]
 const PIPELINE_PHASES = [
   { key: 'L1', label: '调研与 Idea', start: 1, end: 8 },
@@ -148,6 +155,20 @@ const PIPELINE_PHASES = [
   { key: 'L4', label: '实验与分析', start: 14, end: 18 },
   { key: 'L5', label: '写作与交付', start: 19, end: 26 },
 ]
+const COMPACT_PHASES = [
+  { key: 'ground', label: '任务与证据', start: 1, end: 8 },
+  { key: 'plan', label: '方案与校验', start: 9, end: 9 },
+  { key: 'implement', label: '实现与校验', start: 10, end: 13 },
+  { key: 'execute', label: '执行与修复', start: 14, end: 18 },
+  { key: 'report', label: '结果与报告', start: 19, end: 25 },
+  { key: 'verify', label: '独立验收', start: 26, end: 26 },
+]
+
+function projectProgress(project: ProjectInfo): number {
+  return project.workflow === 'compact'
+    ? (project.completedPhases?.length ?? 0) / 6 * 100
+    : Math.min(project.lastCompletedStage || 0, 26) / 26 * 100
+}
 
 function formatTime(ts: number) {
   return new Date(ts).toLocaleString('zh-CN', { hour12: false })
@@ -257,6 +278,9 @@ function artifactDownloadUrl(projectId: string | null, filename: string) {
 
 export default function ResearchLab() {
   const { token: authToken, logout: handleLogout } = useAuth()
+  const [searchParams] = useSearchParams()
+  const requestedProject = searchParams.get('project')
+  const newProject = searchParams.get('new') === '1'
 
   const [projects, setProjects] = useState<ProjectInfo[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
@@ -269,15 +293,17 @@ export default function ResearchLab() {
   const [watchKeywords, setWatchKeywords] = useState('')
   const [watchIntervalHours, setWatchIntervalHours] = useState(24)
   const [watchLookbackDays, setWatchLookbackDays] = useState(30)
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(requestedProject)
   const [connected, setConnected] = useState(false)
   const [topic, setTopic] = useState('')
   const [referencePapers, setReferencePapers] = useState('')
   const [mode, setMode] = useState<'auto' | 'upload' | 'hybrid'>('hybrid')
   const [runMode, setRunMode] = useState<RunMode>('idea_gate')
-  const [modelName, setModelName] = useState(DEFAULT_QWEN3_MODEL)
+  const [researchMode, setResearchMode] = useState<'focused' | 'lab'>('focused')
+  const [deliveryFormat, setDeliveryFormat] = useState<'report' | 'ieee'>('report')
+  const [modelName, setModelName] = useState(DEFAULT_RESEARCH_MODEL)
   const [ideaCount, setIdeaCount] = useState(5)
-  const [chatModelName, setChatModelName] = useState(DEFAULT_QWEN3_MODEL)
+  const [chatModelName, setChatModelName] = useState(DEFAULT_RESEARCH_MODEL)
   const [chatInput, setChatInput] = useState('')
   const [referenceFiles, setReferenceFiles] = useState<ReferencePdfUpload[]>([])
   const [submitError, setSubmitError] = useState('')
@@ -295,10 +321,12 @@ export default function ResearchLab() {
 
   useEffect(() => {
     if (!authToken) return
+    let disposed = false
     let ws: WebSocket | null = null
     let timer: ReturnType<typeof setTimeout> | null = null
 
     const connect = () => {
+      if (disposed) return
       ws = new WebSocket(AGENT_WS)
       wsRef.current = ws
       ws.onopen = () => {
@@ -306,6 +334,7 @@ export default function ResearchLab() {
       }
 
       ws.onmessage = (event) => {
+        if (disposed) return
         try {
           const msg = JSON.parse(event.data) as WSMessage
 
@@ -335,6 +364,9 @@ export default function ResearchLab() {
               setSelectedProjectId(null)
               setLiteraturePapers([])
             }
+          } else if (msg.type === 'research_progress') {
+            setProjects(prev => prev.map(project => project.projectId === msg.payload.projectId
+              ? { ...project, runHealth: msg.payload.health } : project))
           } else if (msg.type === 'artifact_produced') {
             setArtifacts((prev) => {
               const key = `${msg.payload.projectId}:${msg.payload.stage ?? 0}:${msg.payload.filename}:${msg.payload.producedBy}`
@@ -383,6 +415,7 @@ export default function ResearchLab() {
       }
 
       ws.onclose = () => {
+        if (disposed) return
         setConnected(false)
         timer = setTimeout(connect, 3000)
       }
@@ -392,10 +425,14 @@ export default function ResearchLab() {
 
     connect()
     return () => {
+      disposed = true
       if (timer) clearTimeout(timer)
       ws?.close()
     }
   }, [authToken, handleLogout])
+
+  useEffect(() => { if (requestedProject) setSelectedProjectId(requestedProject) }, [requestedProject])
+  useEffect(() => { if (newProject) document.getElementById('research-topic')?.focus() }, [newProject])
 
   useEffect(() => {
     if (!selectedProjectId && projects.length > 0) {
@@ -514,9 +551,10 @@ export default function ResearchLab() {
     ws.send(JSON.stringify({
       command: 'quick_submit',
       topic: cleanTopic,
-      mode: 'lab',
+      mode: researchMode,
       submissionMode: mode,
       runMode,
+      deliveryFormat,
       modelName,
       ideaCount,
       referencePapers: outboundReferencePapers,
@@ -662,18 +700,19 @@ export default function ResearchLab() {
   }
 
   return (
-    <div className="web-layout">
+    <div className="research-page"><div className="page-heading"><div><div className="page-kicker">FROM QUESTION TO DISCOVERY</div><h1>科研工作台<span className="heading-dot">.</span></h1><p>连接你的研究问题、实验过程与每一份可核验的成果。</p></div></div><div className="web-layout">
       <aside className="sidebar">
         <section className="panel">
           <div className="panel-heading">
-            <h2>新项目</h2>
+            <h2>新建科研项目</h2>
             <span className={`connection-pill ${connected ? 'on' : 'off'}`}>
               {connected ? '在线' : '离线'}
             </span>
           </div>
           <div className="field-group">
-            <label>主题</label>
+            <label htmlFor="research-topic">研究主题</label>
             <textarea
+              id="research-topic"
               rows={3}
               placeholder="研究主题"
               value={topic}
@@ -697,6 +736,15 @@ export default function ResearchLab() {
                 <option key={model.value} value={model.value}>{model.label}</option>
               ))}
             </select>
+          </div>
+
+          <div className="field-group">
+            <label>研究方式</label>
+            <div className="mode-grid">
+              <button type="button" aria-pressed={researchMode === 'focused'} className={researchMode === 'focused' ? 'active' : ''} onClick={() => setResearchMode('focused')}>专注研究</button>
+              <button type="button" aria-pressed={researchMode === 'lab'} className={researchMode === 'lab' ? 'active' : ''} onClick={() => setResearchMode('lab')}>多方向探索</button>
+            </div>
+            <p className="field-hint">{researchMode === 'focused' ? '围绕一个问题推进单条研究流程。' : '从多个研究视角并行探索，再合并结论。'}</p>
           </div>
 
           <div className="field-group">
@@ -730,15 +778,24 @@ export default function ResearchLab() {
                 className={runMode === 'full_chain' ? 'active' : ''}
                 onClick={() => setRunMode('full_chain')}
               >
-                全链路 IEEE 论文
+                完整研究流程
               </button>
             </div>
             <p className="field-hint">
               {runMode === 'idea_gate'
                 ? '生成 S8 Idea 后暂停，确认后进入 L2 实验设计。'
-                : '自动完成实验设计、代码生成、真实执行、结果分析，并交付完整 IEEE 双栏论文与 PDF。'}
+                : '自动完成方案、代码、真实实验、报告和独立复核。'}
             </p>
           </div>
+
+          {runMode === 'full_chain' && <div className="field-group">
+            <label>交付形式</label>
+            <div className="mode-grid">
+              <button type="button" aria-pressed={deliveryFormat === 'report'} className={deliveryFormat === 'report' ? 'active' : ''} onClick={() => setDeliveryFormat('report')}>研究报告</button>
+              <button type="button" aria-pressed={deliveryFormat === 'ieee'} className={deliveryFormat === 'ieee' ? 'active' : ''} onClick={() => setDeliveryFormat('ieee')}>IEEE 论文</button>
+            </div>
+            <p className="field-hint">{deliveryFormat === 'report' ? '按任务需要交付报告、代码和图表，不要求论文页数。' : '交付 IEEE 双栏论文、LaTeX 与 PDF，正文目标 8 页。'}</p>
+          </div>}
 
           <div className="field-group">
             <label>参考文献</label>
@@ -767,7 +824,7 @@ export default function ResearchLab() {
           </div>
 
           <button className="primary-button" onClick={submitProject} disabled={!connected || !topic.trim()}>
-            运行
+            创建并开始研究
           </button>
           {submitError && <p className="submit-error">{submitError}</p>}
         </section>
@@ -858,7 +915,7 @@ export default function ResearchLab() {
                 <div className="project-item-meta">
                   <span>{project.lastCompletedName || '未开始'}</span>
                   <span>Stage {project.lastCompletedStage || 0}</span>
-                  <span>{project.runMode === 'literature_watch' ? '文献追踪' : project.runMode === 'idea_gate' ? 'Idea 确认' : 'IEEE 全链路'}</span>
+                  <span>{project.runMode === 'literature_watch' ? '文献追踪' : project.runMode === 'idea_gate' ? 'Idea 确认' : project.deliveryFormat === 'report' ? '研究报告' : 'IEEE 全链路'}</span>
                 </div>
               </button>
             ))}
@@ -876,35 +933,53 @@ export default function ResearchLab() {
               <div className="workspace-badges">
                 <span className={`status-pill status-${selectedProject.status}`}>{selectedProject.status}</span>
                 <span className="meta-pill">{selectedProject.lastCompletedName || '未开始'}</span>
-                <span className="meta-pill">{selectedProject.runMode === 'literature_watch' ? '增量文献综述' : selectedProject.runMode === 'idea_gate' ? '先出 Idea' : '完整 IEEE 论文'}</span>
+                <span className="meta-pill">{selectedProject.runMode === 'literature_watch' ? '增量文献综述' : selectedProject.runMode === 'idea_gate' ? '先出 Idea' : selectedProject.deliveryFormat === 'report' ? '研究报告' : '完整 IEEE 论文'}</span>
               </div>
             </div>
             <div className="research-pipeline-progress">
               <div className="research-pipeline-progress-head">
                 <strong>全链路进度</strong>
                 <span>
-                  S{Math.min(selectedProject.lastCompletedStage || 0, 26)}/26 ·
-                  {Math.round(Math.min(selectedProject.lastCompletedStage || 0, 26) / 26 * 100)}%
+                  {selectedProject.workflow === 'compact'
+                    ? `${selectedProject.completedPhases?.length ?? 0}/6 阶段`
+                    : `S${Math.min(selectedProject.lastCompletedStage || 0, 26)}/26`} ·
+                  {Math.round(projectProgress(selectedProject))}%
                 </span>
               </div>
               <div className="research-pipeline-bar">
-                <span style={{ width: `${Math.min(selectedProject.lastCompletedStage || 0, 26) / 26 * 100}%` }} />
+                <span style={{ width: `${projectProgress(selectedProject)}%` }} />
               </div>
               <div className="research-pipeline-phases">
-                {PIPELINE_PHASES.map((phase) => {
-                  const done = selectedProject.lastCompletedStage >= phase.end
+                {(selectedProject.workflow === 'compact' ? COMPACT_PHASES : PIPELINE_PHASES).map((phase, index) => {
+                  const done = selectedProject.workflow === 'compact'
+                    ? selectedProject.completedPhases?.includes(phase.key)
+                    : selectedProject.lastCompletedStage >= phase.end
                   const active = selectedProject.lastCompletedStage >= phase.start - 1
                     && selectedProject.lastCompletedStage < phase.end
                   return (
                     <div key={phase.key} className={done ? 'done' : active ? 'active' : ''}>
-                      <b>{done ? '✓' : phase.key}</b>
+                      <b>{done ? '✓' : selectedProject.workflow === 'compact' ? index + 1 : phase.key}</b>
                       <span>{phase.label}</span>
-                      <small>S{phase.start}–S{phase.end}</small>
+                      <small>{selectedProject.workflow === 'compact' ? '独立断点 · 产物校验' : `S${phase.start}–S${phase.end}`}</small>
                     </div>
                   )
                 })}
               </div>
             </div>
+
+            {selectedProject.status === 'running' && selectedProject.runHealth && (
+              <div className="run-health-progress" role="status">
+                <strong>{({ model_streaming: '模型正在生成', waiting_provider: '正在等待模型响应', computing: '程序正在计算',
+                  quiet_check_required: '已记录无输出诊断，正在检查', provider_stalled_check_required: '模型请求缺少进展，正在检查',
+                  phase_running: '阶段正在处理', controller_finished: '本次运行已结束' } as Record<string, string>)[selectedProject.runHealth.status ?? ''] ?? '正在检查运行状态'}</strong>
+                <span>本阶段 {Math.floor((selectedProject.runHealth.phase_elapsed_sec ?? 0) / 60)} 分 {Math.floor((selectedProject.runHealth.phase_elapsed_sec ?? 0) % 60)} 秒
+                  {' · '}{selectedProject.runHealth.request_active ? '当前请求' : '最近请求'} {Math.floor(selectedProject.runHealth.request_elapsed_sec ?? 0)} 秒
+                  {' · '}已收到 {selectedProject.runHealth.semantic_chars ?? 0} 个字符</span>
+                <small>每 30 秒更新；模型长请求、程序执行和无进展会分别显示。
+                  {selectedProject.runHealth.observed_at && <> 最近检查：{new Date(selectedProject.runHealth.observed_at * 1000).toLocaleTimeString()}</>}
+                </small>
+              </div>
+            )}
 
             <div className="workspace-body chat-first-layout">
               <section className="chat-shell">
@@ -980,7 +1055,7 @@ export default function ResearchLab() {
                     <span>{selectedArtifacts.length}</span>
                   </div>
                   <div className="workspace-actions workspace-actions-compact">
-                    <button onClick={() => sendProjectCommand('pause_project')} disabled={selectedProject.status !== 'running'}>
+                    <button onClick={() => sendProjectCommand('pause_project')} disabled={!['running', 'queued'].includes(selectedProject.status)}>
                       暂停
                     </button>
                     <button onClick={() => sendProjectCommand('resume_project')} disabled={selectedProject.status === 'running'}>
@@ -1144,6 +1219,11 @@ export default function ResearchLab() {
                   )}
                 </section>
 
+                <ResearchQualityPanel
+                  artifacts={selectedArtifacts}
+                  downloadUrl={(filename) => artifactDownloadUrl(selectedProjectId, filename)}
+                />
+
                 <section className="artifact-section focus-card context-card">
                   <div className="panel-heading">
                     <h3>最终产物</h3>
@@ -1163,9 +1243,13 @@ export default function ResearchLab() {
                           title="导出 PDF"
                         >📄 PDF</button>
                         <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'paper_final.md')} target="_blank" rel="noreferrer">paper.md</a>
+                        <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'experiment.zip')} target="_blank" rel="noreferrer">实验代码与结果 ZIP</a>
+                        <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'outputs.zip')} target="_blank" rel="noreferrer">数据与图表 ZIP</a>
+                        {selectedProject.deliveryFormat !== 'report' && <>
                         <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'paper.pdf')} target="_blank" rel="noreferrer">paper.pdf</a>
                         <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'paper.tex')} target="_blank" rel="noreferrer">paper.tex</a>
                         <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'references.bib')} target="_blank" rel="noreferrer">bib</a>
+                        </>}
                       </div>
                       <pre id="final-paper-content">{latestFinalPaperArtifact.content || '最终稿已生成，可通过上方按钮下载。'}</pre>
                     </>
@@ -1250,6 +1334,6 @@ export default function ResearchLab() {
           </div>
         )}
       </section>
-    </div>
+    </div></div>
   )
 }

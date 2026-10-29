@@ -1,3 +1,5 @@
+import { PRODUCT_NAME, PRODUCT_NAME_ZH } from './brand'
+
 export function downloadMarkdown(content: string, filename: string) {
   const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -516,7 +518,7 @@ export function printContentAsPdf(content: string, title: string) {
     <h1>${escapeHtml(docTitle)}</h1>
     <div class="meta">
       <span>生成日期：${today}</span>
-      <span>来源：Claw AI Lab</span>
+      <span>来源：${PRODUCT_NAME} · ${PRODUCT_NAME_ZH}</span>
     </div>
   </div>
 

@@ -1,0 +1,421 @@
+{
+  "anthropic/frontend-design": {
+    "stages": [
+      11,
+      13,
+      16,
+      18
+    ],
+    "signals": [
+      "frontend",
+      "react",
+      "web",
+      "界面",
+      "前端",
+      "dashboard"
+    ],
+    "priority": 36,
+    "category": "delivery"
+  },
+  "anthropic/web-artifacts-builder": {
+    "stages": [
+      11,
+      13,
+      16,
+      18
+    ],
+    "signals": [
+      "frontend",
+      "react",
+      "web",
+      "界面",
+      "前端",
+      "dashboard"
+    ],
+    "priority": 36,
+    "category": "delivery"
+  },
+  "anthropic/webapp-testing": {
+    "stages": [
+      13,
+      16,
+      18,
+      26
+    ],
+    "signals": [
+      "frontend",
+      "web",
+      "browser",
+      "界面",
+      "前端"
+    ],
+    "priority": 36,
+    "category": "engineering"
+  },
+  "anthropic/mcp-builder": {
+    "stages": [
+      9,
+      11,
+      13
+    ],
+    "signals": [
+      "mcp",
+      "tool server",
+      "工具服务"
+    ],
+    "priority": 34,
+    "category": "engineering"
+  },
+  "anthropic/skill-creator": {
+    "stages": [
+      9,
+      13,
+      26
+    ],
+    "signals": [
+      "skill creation",
+      "skill author",
+      "技能创建",
+      "技能开发"
+    ],
+    "priority": 35,
+    "category": "engineering"
+  },
+  "anthropic/canvas-design": {
+    "stages": [
+      16,
+      18,
+      19,
+      25
+    ],
+    "signals": [
+      "poster",
+      "presentation",
+      "canvas",
+      "海报",
+      "演示",
+      "可视化设计"
+    ],
+    "priority": 24,
+    "category": "delivery"
+  },
+  "anthropic/algorithmic-art": {
+    "stages": [
+      16,
+      18,
+      19,
+      25
+    ],
+    "signals": [
+      "poster",
+      "presentation",
+      "canvas",
+      "海报",
+      "演示",
+      "可视化设计"
+    ],
+    "priority": 24,
+    "category": "delivery"
+  },
+  "anthropic/theme-factory": {
+    "stages": [
+      16,
+      18,
+      19,
+      25
+    ],
+    "signals": [
+      "poster",
+      "presentation",
+      "canvas",
+      "海报",
+      "演示",
+      "可视化设计"
+    ],
+    "priority": 24,
+    "category": "delivery"
+  },
+  "superpowers/systematic-debugging": {
+    "stages": [
+      12,
+      13,
+      15,
+      16,
+      18
+    ],
+    "signals": [
+      "error",
+      "failed",
+      "failure",
+      "exception",
+      "traceback",
+      "regress",
+      "bug",
+      "错误",
+      "失败",
+      "修复"
+    ],
+    "priority": 62,
+    "category": "engineering"
+  },
+  "superpowers/verification-before-completion": {
+    "stages": [
+      17,
+      21,
+      23,
+      26
+    ],
+    "signals": [],
+    "priority": 55,
+    "category": "engineering"
+  },
+  "superpowers/test-driven-development": {
+    "stages": [
+      11,
+      13
+    ],
+    "signals": [
+      "implement",
+      "algorithm",
+      "solver",
+      "numerical",
+      "code",
+      "实现",
+      "算法",
+      "数值"
+    ],
+    "priority": 25,
+    "category": "engineering"
+  },
+  "superpowers/writing-plans": {
+    "stages": [
+      9
+    ],
+    "signals": [
+      "implementation plan",
+      "software",
+      "工程",
+      "软件"
+    ],
+    "priority": 20,
+    "category": "engineering"
+  },
+  "superpowers/receiving-code-review": {
+    "stages": [
+      13,
+      15,
+      21,
+      26
+    ],
+    "signals": [
+      "code review",
+      "代码审查",
+      "代码评审",
+      "review feedback"
+    ],
+    "priority": 38,
+    "category": "engineering"
+  },
+  "superpowers/requesting-code-review": {
+    "stages": [
+      13,
+      15,
+      21,
+      26
+    ],
+    "signals": [
+      "code review",
+      "代码审查",
+      "代码评审",
+      "review feedback"
+    ],
+    "priority": 38,
+    "category": "engineering"
+  },
+  "superpowers/writing-skills": {
+    "stages": [
+      9,
+      13
+    ],
+    "signals": [
+      "skill creation",
+      "skill author",
+      "技能创建",
+      "技能开发"
+    ],
+    "priority": 30,
+    "category": "engineering"
+  },
+  "trailofbits/dimensional-analysis": {
+    "stages": [
+      9,
+      14,
+      16,
+      18,
+      26
+    ],
+    "signals": [
+      "physics",
+      "physical",
+      "mass",
+      "uncert",
+      "dimension",
+      "units",
+      "物理",
+      "质量",
+      "误差",
+      "单位",
+      "量纲"
+    ],
+    "priority": 55,
+    "category": "science"
+  },
+  "trailofbits/property-based-testing": {
+    "stages": [
+      9,
+      11,
+      13,
+      16,
+      18
+    ],
+    "signals": [
+      "algorithm",
+      "numerical",
+      "invariant",
+      "metamorphic",
+      "operator",
+      "算法",
+      "数值",
+      "不变",
+      "误差"
+    ],
+    "priority": 42,
+    "category": "engineering"
+  },
+  "trailofbits/modern-python": {
+    "stages": [
+      11,
+      13
+    ],
+    "signals": [],
+    "priority": 20,
+    "category": "engineering"
+  },
+  "trailofbits/spec-to-code-compliance": {
+    "stages": [
+      9,
+      13,
+      21,
+      26
+    ],
+    "signals": [
+      "protocol",
+      "specification",
+      "method fidelity",
+      "source method",
+      "协议",
+      "方法一致",
+      "规范"
+    ],
+    "priority": 33,
+    "category": "engineering"
+  },
+  "trailofbits/differential-review": {
+    "stages": [
+      13,
+      15,
+      16,
+      18,
+      26
+    ],
+    "signals": [
+      "regress",
+      "revision",
+      "patch",
+      "fix",
+      "修订",
+      "修复",
+      "回归"
+    ],
+    "priority": 40,
+    "category": "engineering"
+  },
+  "trailofbits/post-patch-validation": {
+    "stages": [
+      13,
+      15,
+      16,
+      18,
+      26
+    ],
+    "signals": [
+      "regress",
+      "revision",
+      "patch",
+      "fix",
+      "修订",
+      "修复",
+      "回归"
+    ],
+    "priority": 40,
+    "category": "engineering"
+  },
+  "trailofbits/mutation-testing": {
+    "stages": [
+      13,
+      16,
+      18
+    ],
+    "signals": [
+      "mutation",
+      "test coverage",
+      "变异测试",
+      "测试覆盖"
+    ],
+    "priority": 35,
+    "category": "engineering"
+  },
+  "trailofbits/coverage-analysis": {
+    "stages": [
+      13,
+      16,
+      18
+    ],
+    "signals": [
+      "test coverage",
+      "code coverage",
+      "测试覆盖"
+    ],
+    "priority": 35,
+    "category": "engineering"
+  },
+  "trailofbits/audit-context-building": {
+    "stages": [
+      3,
+      7,
+      9,
+      13
+    ],
+    "signals": [
+      "codebase",
+      "source code",
+      "代码库",
+      "源码"
+    ],
+    "priority": 26,
+    "category": "engineering"
+  },
+  "trailofbits/writing-lean-proofs": {
+    "stages": [
+      9,
+      13,
+      26
+    ],
+    "signals": [
+      "lean",
+      "mathlib"
+    ],
+    "priority": 38,
+    "category": "science"
+  }
+}

@@ -11,9 +11,37 @@ import hashlib
 import json
 import os
 import time
+import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_TRACE_CONTEXT: ContextVar[tuple[str, str] | None] = ContextVar("research_trace_context", default=None)
+
+
+def provider_activity(status: str, **fields: Any) -> None:
+    """Metadata-only progress; never persist prompts, credentials or reasoning text."""
+    context = _TRACE_CONTEXT.get()
+    if not context:
+        return
+    from researchclaw.orchestration.artifacts import read_json, write_json
+    path = Path(context[0]).parent / "provider_activity.json"
+    now = time.time()
+    record = {} if status == "started" else read_json(path)
+    record.setdefault("started_at", now)
+    record.update(status=status, stage=int(context[1]), pid=os.getpid(), updated_at=now, **fields)
+    if status == "streaming":
+        record["last_semantic_progress_at"] = now
+    try:
+        write_json(path, record)
+    except OSError:
+        pass  # Optional telemetry must not discard a successful paid response.
+
+
+def current_stage_number() -> int | None:
+    context = _TRACE_CONTEXT.get()
+    return int(context[1]) if context else None
 
 
 def utcnow_iso() -> str:
@@ -52,11 +80,10 @@ class StageTrace:
         self.stage_name = stage_name
         self.run_id = run_id
         self._start = time.monotonic()
-        self._previous_env = os.environ.get('RESEARCHCLAW_TRACE_DIR')
+        self._token = None
 
     def __enter__(self) -> 'StageTrace':
-        os.environ['RESEARCHCLAW_TRACE_DIR'] = str(self.trace_dir)
-        os.environ['RESEARCHCLAW_TRACE_STAGE'] = str(self.stage_no)
+        self._token = _TRACE_CONTEXT.set((str(self.trace_dir), str(self.stage_no)))
         trace_event(self.trace_dir, 'stage_started', {
             'run_id': self.run_id,
             'stage': self.stage_no,
@@ -65,11 +92,9 @@ class StageTrace:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if self._previous_env is None:
-            os.environ.pop('RESEARCHCLAW_TRACE_DIR', None)
-        else:
-            os.environ['RESEARCHCLAW_TRACE_DIR'] = self._previous_env
-        os.environ.pop('RESEARCHCLAW_TRACE_STAGE', None)
+        if self._token is not None:
+            _TRACE_CONTEXT.reset(self._token)
+            self._token = None
 
     def finish(self, *, status: str, artifacts_count: int, error: str = '') -> None:
         trace_event(self.trace_dir, 'stage_finished', {
@@ -101,13 +126,14 @@ def trace_llm_call(
     request_body: dict[str, Any] | None = None,
     response_content: str = '',
 ) -> None:
-    trace_dir = os.environ.get('RESEARCHCLAW_TRACE_DIR', '')
+    context = _TRACE_CONTEXT.get()
+    trace_dir = context[0] if context else os.environ.get('RESEARCHCLAW_TRACE_DIR', '')
     if not trace_dir:
         return
     prompt_text = '\n'.join(str(m.get('content', '')) for m in messages)
     response_text = response_content or ''
-    stage = os.environ.get('RESEARCHCLAW_TRACE_STAGE', '')
-    call_id = f"{int(time.time() * 1000)}-{os.getpid()}-{stage}"
+    stage = context[1] if context else os.environ.get('RESEARCHCLAW_TRACE_STAGE', '')
+    call_id = f"{int(time.time() * 1000)}-{os.getpid()}-{stage}-{uuid.uuid4().hex[:12]}"
     request_chars = 0
     if request_body is not None:
         try:
@@ -134,7 +160,8 @@ def trace_llm_call(
         'response_chars': len(response_text),
         'prompt_tokens': prompt_tokens,
         'completion_tokens': completion_tokens,
-        'total_tokens': total_tokens,
+        'total_tokens': total_tokens or (prompt_tokens + completion_tokens),
+        'usage_reported': bool(total_tokens or prompt_tokens or completion_tokens),
         'finish_reason': finish_reason,
         'error': error[:500],
     }
@@ -193,6 +220,8 @@ def write_llm_trace_summary(run_dir: str | Path) -> dict[str, Any]:
         'total_prompt_tokens': sum(int(c.get('prompt_tokens') or 0) for c in calls),
         'total_completion_tokens': sum(int(c.get('completion_tokens') or 0) for c in calls),
         'total_tokens': sum(int(c.get('total_tokens') or 0) for c in calls),
+        'usage_missing_count': sum(1 for c in calls if c.get('status') == 'ok' and not c.get('usage_reported', bool(c.get('total_tokens')))),
+        'usage_complete': any(c.get('status') == 'ok' for c in calls) and all(c.get('usage_reported', bool(c.get('total_tokens'))) for c in calls if c.get('status') == 'ok'),
         'total_latency_sec': round(sum(float(c.get('latency_sec') or 0) for c in calls), 3),
         'by_model': by_model,
         'by_stage': by_stage,

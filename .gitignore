@@ -44,7 +44,13 @@ Thumbs.db
 # ── Env / Secrets ──
 .env
 .env.*
+!.env.example
 *.key
+*.pem
+*.p12
+*.pfx
+provider.env
+config.arc.local.yaml
 
 # ── Archives ──
 *.zip
@@ -70,6 +76,11 @@ outputs/
 backend/eval_cache/
 backend/agent/runs/
 backend/review_history/
+backend/review_cache/
+docs/kb/
+docs/agent_engineer_interview_tech_doc.md
+docs/researchclawbench-internal.md
+.local/
 runs/
 .researchclaw_cache/
 How To Do Research.pdf
@@ -77,3 +88,14 @@ How To Do Research.pdf
 # ── Node (frontend-web) ──
 frontend-web/node_modules/
 frontend-web/dist/
+# EMNETS Web local environment and browser artifacts
+.venv-web/
+frontend-web/test-results/
+frontend-web/playwright-report/
+frontend-web/artifacts/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/

@@ -109,7 +109,8 @@ class ACPClient:
         accepted but not forwarded — the agent manages its own model and
         parameters.
         """
-        prompt_text = self._messages_to_prompt(messages, system=system)
+        from researchclaw.orchestration.context import augment_system
+        prompt_text = self._messages_to_prompt(messages, system=augment_system(system))
         content = self._send_prompt(prompt_text)
         if strip_thinking:
             from researchclaw.utils.thinking_tags import strip_thinking_tags

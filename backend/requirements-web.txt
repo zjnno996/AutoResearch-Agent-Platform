@@ -1,0 +1,6 @@
+# Install from the repository root alongside: pip install -e backend/agent
+websockets>=15,<17
+psutil>=5.9
+PyMuPDF>=1.23
+Pillow>=10
+httpx>=0.24

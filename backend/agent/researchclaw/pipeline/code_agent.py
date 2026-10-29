@@ -1328,7 +1328,7 @@ class CodeAgent:
     def _extract_files(self, content: str) -> dict[str, str]:
         """Extract multi-file code blocks from LLM output."""
         # Local import to avoid circular dependency with executor.py
-        from researchclaw.pipeline.executor import _extract_multi_file_blocks
+        from researchclaw.pipeline.support.parsing import _extract_multi_file_blocks
 
         return _extract_multi_file_blocks(content)
 

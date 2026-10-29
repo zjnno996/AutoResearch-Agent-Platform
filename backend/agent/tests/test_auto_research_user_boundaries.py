@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -123,7 +124,7 @@ def test_fallback_prefers_real_sklearn_builtin_for_simple_classification(tmp_pat
     for name, content in result.files.items():
         (exp_dir / name).write_text(content, encoding="utf-8")
     completed = subprocess.run(
-        ["/opt/conda/envs/clawailab/bin/python", "main.py"],
+        [sys.executable, "main.py"],
         cwd=exp_dir,
         capture_output=True,
         text=True,

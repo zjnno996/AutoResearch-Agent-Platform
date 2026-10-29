@@ -1,12 +1,12 @@
 """Fallback code generators.
 
-Produces a minimal runnable experiment when all other strategies fail.  Prefer
-small real built-in sklearn datasets for matching lightweight classification
-topics; otherwise fall back to a synthetic objective for pipeline plumbing.
+Real experiments may use only a compatible, explicitly requested dataset.
+Synthetic plumbing examples are restricted to simulated execution mode.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from researchclaw.config import RCConfig
@@ -43,6 +43,11 @@ class FallbackStrategy:
         if self._should_use_sklearn_builtin(ctx, config):
             session.log(CodegenPhase.FALLBACK, "Using sklearn built-in real-dataset fallback generator")
             return self._generate_sklearn_builtin(ctx)
+
+        if ctx.mode != "simulated":
+            message = "Code generation failed and no task-compatible fallback is available; the task's data and scientific objective must be preserved."
+            session.log_error(CodegenPhase.FALLBACK, message)
+            return CodegenResult(strategy_name="fallback_unavailable", error=message)
 
         session.log(CodegenPhase.FALLBACK, "Using numpy synthetic fallback generator")
         metric = ctx.metric
@@ -90,31 +95,26 @@ class FallbackStrategy:
 
     @staticmethod
     def _should_use_sklearn_builtin(ctx: CodegenContext, config: RCConfig) -> bool:
-        text = " ".join([
-            getattr(getattr(config, "research", None), "topic", "") or "",
-            ctx.exp_plan or "",
-        ]).lower()
-        positive = (
-            "sklearn", "scikit-learn", "iris", "wine", "breast cancer",
-            "breast_cancer", "tabular", "classification", "logistic regression",
-            "random forest",
-        )
+        if ctx.datasets_dir or ctx.checkpoints_dir:
+            return False
+        text = (getattr(getattr(config, "research", None), "topic", "") or ctx.topic).lower()
+        named_dataset = bool(re.search(r"(?<![a-z0-9])(?:iris|wine|breast[ _-]?cancer)(?![a-z0-9])", text))
+        allows_builtin = any(term in text for term in ("built-in", "builtin", "内置数据")) and any(
+            term in text for term in ("sklearn", "scikit-learn", "classification", "分类"))
         negative = (
             "diffusion", "gan", "llm inference", "kv cache", "transformer serving",
             "vision-language", "video", "3d", "object detection", "segmentation",
         )
-        return any(p in text for p in positive) and not any(n in text for n in negative)
+        return (named_dataset or allows_builtin) and not any(n in text for n in negative)
 
     @staticmethod
     def _should_use_uci_har(ctx: CodegenContext, config: RCConfig) -> bool:
-        text = " ".join([
-            getattr(getattr(config, "research", None), "topic", "") or "",
-            ctx.exp_plan or "",
-        ]).lower()
-        return any(term in text for term in (
-            "imu", "inertial", "accelerometer", "gyroscope", "uci-har",
-            "activity recognition", "惯性", "加速度计", "陀螺仪",
-        ))
+        if ctx.datasets_dir or ctx.checkpoints_dir:
+            return False
+        text = (getattr(getattr(config, "research", None), "topic", "") or ctx.topic).lower()
+        # "imu" must not match ordinary words such as minimum or simulation.
+        return bool(re.search(r"(?<![a-z0-9])(?:imu|inertial|accelerometer|gyroscope|uci[- _]?har)(?![a-z0-9])", text)
+                    or any(term in text for term in ("activity recognition", "惯性", "加速度计", "陀螺仪")))
 
     @staticmethod
     def _generate_uci_har(ctx: CodegenContext) -> CodegenResult:

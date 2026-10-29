@@ -11,8 +11,8 @@ from review_engine.consensus import CandidateIssue, calibrate_absence_claims
 from review_engine.export_utils import export_latex
 from services.review_service import (
     ReviewHandler,
-    _qwen_health,
-    _qwen_unavailable_message,
+    _review_model_health,
+    _review_unavailable_message,
     _validate_uploaded_base64,
 )
 
@@ -44,17 +44,17 @@ def test_multipart_parser_handles_binary_pdf_and_text_fields() -> None:
     assert parts[1] == ("dimensions", '["methodology"]', "")
 
 
-def test_qwen_health_reports_endpoint_failure_without_marking_business_down(
+def test_review_model_health_reports_endpoint_failure_without_marking_business_down(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "services.review_service._configured_qwen_endpoints",
+        "services.review_service._configured_review_endpoints",
         lambda: ["http://127.0.0.1:1/v1"],
     )
-    health = _qwen_health(timeout_sec=0.01)
+    health = _review_model_health(timeout_sec=0.01)
     assert health["available"] is False
     assert health["endpoints"][0]["available"] is False
-    message = _qwen_unavailable_message(health)
+    message = _review_unavailable_message(health)
     assert "未生成、未保存" in message
     assert "127.0.0.1:1" in message
 
@@ -96,7 +96,31 @@ def test_same_qwen_model_keeps_independent_endpoint_failover(monkeypatch) -> Non
         review_llm_client._llm_clients = old_clients
 
 
-def test_run_review_is_qwen_only_and_returns_confidence_filtered_findings() -> None:
+def test_flash_review_model_and_reasoning_budget_override_web_chat_default(monkeypatch) -> None:
+    config = {
+        "web_chat_llm": {"primary_model": "Qwen3-Test", "base_url": "https://old.test/v1", "api_key": "fixture"},
+        "review_llm": {"primary_model": "deepseek-flash", "base_url": "https://api.deepseek.com/v1",
+                       "api_key": "", "api_key_env": "TEST_REVIEW_KEY", "max_tokens": 32768,
+                       "reasoning_token_reserve": 8192,
+                       "extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}},
+    }
+    monkeypatch.setattr(review_llm_client, "_load_config", lambda: config)
+    monkeypatch.setattr(review_llm_client, "_llm_configs", [])
+    monkeypatch.setattr(review_llm_client, "_llm_model_options", [])
+    monkeypatch.setattr(review_llm_client, "_llm_clients", {})
+    monkeypatch.setattr(review_llm_client, "_primary_model_name", "Qwen3-Test")
+    monkeypatch.setenv("TEST_REVIEW_KEY", "fixture-only")
+    model = review_llm_client.get_preferred_review_model_name()
+    client = review_llm_client.get_client_for_model(model)
+    assert model == client.config.primary_model == "deepseek-flash"
+    assert client.config.base_url == "https://api.deepseek.com/v1"
+    assert client.config.api_key == "fixture-only"
+    assert client.config.max_tokens == 32768
+    assert client.config.reasoning_token_reserve == 8192
+    assert client.config.extra_body["reasoning_effort"] == "high"
+
+
+def test_run_review_uses_configured_model_and_returns_confidence_filtered_findings() -> None:
     captured = {}
     dimension_result = {
         "dimensionId": "methodology", "score": 65, "summary": "ok",
@@ -132,17 +156,18 @@ def test_run_review_is_qwen_only_and_returns_confidence_filtered_findings() -> N
         stack.enter_context(patch.object(reviewer, "_run_review_deep_dive", return_value={"weaknesses": [], "suggestions": []}))
         stack.enter_context(patch.object(reviewer, "_run_review_patch", return_value={"weaknesses": [], "suggestions": []}))
         stack.enter_context(patch.object(reviewer, "_generate_overall_summary", return_value={"overallAssessment": "ok"}))
+        stack.enter_context(patch.object(reviewer, "get_preferred_review_model_name", return_value="deepseek-flash"))
         stack.enter_context(patch.object(reviewer, "get_client_for_model", return_value=object()))
         stack.enter_context(patch.object(reviewer, "run_consensus_pipeline", side_effect=fake_consensus))
         results, meta, _ = reviewer.run_review(
             base64.b64encode(b"fake-pdf").decode(), "paper.pdf",
-            ["methodology"], model="deepseek-v4-flash", vision_reader=False,
+            ["methodology"], model="deepseek-flash", vision_reader=False,
         )
 
     assert results
-    assert meta["review_model"] == "Qwen3.5-122B-A10B-FP8"
-    assert meta["model_policy"] == "qwen_only"
-    assert captured["model"] == "Qwen3.5-122B-A10B-FP8"
+    assert meta["review_model"] == "deepseek-flash"
+    assert meta["model_policy"] == "configured_single_model"
+    assert captured["model"] == "deepseek-flash"
     assert len(meta["verifiedFindings"]) == 1
     assert results[0]["weaknesses"] == ["第3章缺少复杂度分析"]
     assert results[0]["filteredLowConfidenceCount"] == 0
@@ -199,6 +224,7 @@ def test_review_stage_checkpoint_reuses_completed_qwen_stages(tmp_path) -> None:
         stack.enter_context(patch.object(reviewer, "_run_expert_coverage_sweep", return_value=[]))
         stack.enter_context(patch.object(reviewer, "run_consensus_pipeline", consensus))
         stack.enter_context(patch.object(reviewer, "_generate_overall_summary", summary))
+        stack.enter_context(patch.object(reviewer, "get_preferred_review_model_name", return_value="deepseek-flash"))
         stack.enter_context(patch.object(reviewer, "get_client_for_model", return_value=object()))
         first = reviewer.run_review(
             base64.b64encode(b"checkpoint-pdf").decode(), "checkpoint.pdf",

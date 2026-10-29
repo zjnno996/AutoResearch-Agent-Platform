@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
+import pytest
 
 
 def _load_agent_bridge_module():
@@ -44,6 +45,42 @@ def test_generate_config_from_template_persists_reference_papers(tmp_path: Path)
         "/data/papers/local_reference.pdf",
     ]
     assert "__REFERENCE_PAPERS__" not in content
+    assert parsed["research"]["reference_purpose"] == "background"
+
+
+def test_explicit_reproduction_project_retains_reference_target_semantics(tmp_path: Path) -> None:
+    bridge = _load_agent_bridge_module()
+    state = SimpleNamespace(runs_base_dir=str(tmp_path / "runs"), agent_package_dir=str(tmp_path / "agent"))
+    path = bridge._generate_config_from_template(state, "reproduce", "Reproduce the requested method",
+        reference_papers=["target.pdf"], reference_purpose="reproduction")
+    assert yaml.safe_load(Path(path).read_text())["research"]["reference_purpose"] == "reproduction"
+
+
+def test_flash_selection_reaches_new_research_project_without_inline_credentials(tmp_path: Path, monkeypatch) -> None:
+    bridge = _load_agent_bridge_module()
+    section = {"primary_model": "deepseek-flash", "provider": "openai-compatible",
+               "base_url": "https://api.deepseek.com/v1", "api_key": "", "api_key_env": "DEEPSEEK_API_KEY",
+               "max_tokens": 32768, "reasoning_token_reserve": 8192,
+               "extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}}
+    monkeypatch.setattr(bridge, "_load_root_arc_config", lambda: {"llm": section})
+    state = SimpleNamespace(runs_base_dir=str(tmp_path / "runs"), agent_package_dir=str(tmp_path / "agent"))
+    path = bridge._generate_config_from_template(state, "flash-project", "Analyze the supplied numerical problem", model_name="deepseek-flash")
+    llm = yaml.safe_load(Path(path).read_text())["llm"]
+    assert llm["primary_model"] == llm["coding_model"] == "deepseek-flash"
+    assert llm["base_url"] == "https://api.deepseek.com/v1"
+    assert llm["api_key"] == "" and llm["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert llm["reasoning_token_reserve"] == 8192 and llm["max_tokens"] == 32768
+    assert llm["extra_body"] == section["extra_body"]
+
+
+def test_model_selection_preserves_configured_non_qwen_models(tmp_path: Path, monkeypatch) -> None:
+    bridge = _load_agent_bridge_module()
+    assert bridge._coerce_model_name("deepseek-flash") == "deepseek-flash"
+    assert bridge._coerce_model_name("configured/research-model") == "configured/research-model"
+    monkeypatch.setattr(bridge, "_load_root_arc_config", lambda: {"llm": {"primary_model": "deepseek-flash"}})
+    state = SimpleNamespace(runs_base_dir=str(tmp_path / "runs"), agent_package_dir=str(tmp_path / "agent"))
+    with pytest.raises(ValueError, match="no configured endpoint"):
+        bridge._generate_config_from_template(state, "unsupported", "Research task", model_name="unconfigured-model")
 
 
 def test_persist_reference_uploads_saves_pdf_files(tmp_path: Path) -> None:
@@ -65,6 +102,27 @@ def test_persist_reference_uploads_saves_pdf_files(tmp_path: Path) -> None:
     assert saved_path.exists()
     assert saved_path.suffix == ".pdf"
     assert saved_path.read_bytes() == b"%PDF-1.4 sample"
+
+
+def test_web_project_inherits_research_policy_and_preserves_multiline_inputs(tmp_path: Path, monkeypatch) -> None:
+    agent_bridge = _load_agent_bridge_module()
+    state = SimpleNamespace(runs_base_dir=str(tmp_path / "runs"), agent_package_dir=str(tmp_path / "agent"))
+    monkeypatch.setattr(agent_bridge, "_load_root_arc_config", lambda: {
+        "research_engine": {"study_type": "reproduction", "max_repair_rounds": 5, "skill_context_chars": 32000}})
+    topic = '复现 "the method"\n保留数据路径 C:\\research\\new\\task，不能替换实验。'
+    reference = 'C:\\papers\\reference "one".pdf'
+    code_dir = str(tmp_path / 'code "with quotes"')
+    path = agent_bridge._generate_config_from_template(state, "policy-test", topic,
+        reference_papers=[reference], codebases_dir=code_dir)
+    parsed = yaml.safe_load(Path(path).read_text())
+    assert parsed["research"]["topic"] == topic
+    assert parsed["research"]["reference_papers"] == [reference]
+    assert parsed["research"]["domains"] == []
+    assert parsed["experiment"]["codebases_dir"] == code_dir
+    assert parsed["research_engine"]["study_type"] == "reproduction"
+    assert parsed["research_engine"]["max_repair_rounds"] == 5
+    assert parsed["research_engine"]["skill_context_chars"] == 32000
+    assert parsed["research_engine"]["profile"] == "quality_first"
 
 
 def test_list_all_projects_treats_live_subrun_heartbeat_as_running(

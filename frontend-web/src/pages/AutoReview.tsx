@@ -540,19 +540,15 @@ export default function AutoReview() {
       .then((r) => r.json())
       .then((data) => {
         if (data.models?.length) {
-          const qwenModels = data.models.filter((item: ModelOption) =>
-            item.value.toLowerCase().includes('qwen')
-          )
-          if (qwenModels.length === 0) throw new Error('AutoReview requires Qwen')
-          setModels(qwenModels)
-          setSelectedModel(qwenModels[0].value)
+          setModels(data.models)
+          setSelectedModel(data.models[0].value)
         }
       })
       .catch(() => {
         setModels([
-          { value: 'Qwen3.5-122B-A10B-FP8', label: 'Qwen3.5-122B (Local)', baseUrl: '' },
+          { value: 'Qwen3.8-27B-FP8', label: 'Qwen3.8-27B-FP8', baseUrl: '' },
         ])
-        setSelectedModel('Qwen3.5-122B-A10B-FP8')
+        setSelectedModel('Qwen3.8-27B-FP8')
       })
   }, [])
 
@@ -601,6 +597,7 @@ export default function AutoReview() {
       const decoder = new TextDecoder()
       let buffer = ''
       const allResults: ReviewResult[] = []
+      let completed = false
 
       while (true) {
         const { done, value } = await reader.read()
@@ -618,6 +615,7 @@ export default function AutoReview() {
               allResults.push(event.result)
               setDimStatus((prev) => ({ ...prev, [event.dimensionId]: 'done' }))
             } else if (event.type === 'complete') {
+              completed = true
               setResults(event.results)
               setKeyFindings(event.keyFindings || null)
               const nextTopIssues = event.topIssues || event.meta?.topIssues || []
@@ -654,6 +652,7 @@ export default function AutoReview() {
       }
 
       // If stream ended without a complete event, something went wrong
+      if (completed) return
       if (allResults.length > 0) {
         setResults(allResults)
         setTopIssues([])
@@ -920,7 +919,7 @@ export default function AutoReview() {
         useCORS: true,
         backgroundColor: '#ffffff',
       })
-      const pdf = new jsPDF('p', 'mm', 'a4')
+      const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true })
       const pdfW = pdf.internal.pageSize.getWidth()
       const pdfH = pdf.internal.pageSize.getHeight()
       const ratio = pdfW / canvas.width
@@ -978,7 +977,8 @@ export default function AutoReview() {
   return (
     <div className="review-page">
       <div className="review-header">
-        <h1>Auto Review</h1>
+        <div className="page-kicker">PEER REVIEW, WITH EVIDENCE</div>
+        <h1>学术评审<span className="heading-dot">.</span></h1>
         <p className="review-subtitle">{reviewMode === 'thesis' ? '上传论文，从多个维度自动评审' : 'Upload a paper for multi-dimensional auto review'}</p>
       </div>
 
@@ -1106,7 +1106,7 @@ export default function AutoReview() {
             <section className="review-section">
               <h2>统一模型策略</h2>
               <p className="review-section-desc">
-                图表读取、分维度评审、并行专家召回、证据核验、定向 Debate 和总评均使用 Qwen3 系列模型。
+                图表读取、分维度评审、专家复核、证据核验、定向讨论和总评均使用配置中的评审模型。
               </p>
               <div className="review-model-select">
                 <strong>{models.find((model) => model.value === selectedModel)?.label || selectedModel}</strong>
@@ -1334,7 +1334,7 @@ function PdfSummaryReport({
     <article className="review-pdf-summary">
       <header className="review-pdf-summary-header">
         <div>
-          <p className="review-pdf-kicker">CLAW AI · AUTO REVIEW</p>
+          <p className="review-pdf-kicker">EMNETS-RA · RESEARCH REVIEW</p>
           <h1>自动评审修改意见摘要</h1>
           <p className="review-pdf-file">{fileName || '未命名论文'}</p>
         </div>

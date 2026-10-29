@@ -45,6 +45,7 @@ _SERVICE_DIR = Path(__file__).resolve().parent
 if str(_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(_SERVICE_DIR))
 from user_auth import register_user, login_user, verify_token, load_users
+from research_capabilities import public_run_health
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -79,7 +80,7 @@ LAYER_RANGE_PHASE2: dict[str, tuple[int, int]] = {"idea": (8, 8)}
 
 DISCUSSION_STAGE = 100
 PROJECT_TERMINAL_STAGE = 26
-DEFAULT_QWEN3_MODEL = "Qwen3.5-122B-A10B-FP8"
+DEFAULT_RESEARCH_MODEL = "Qwen3.8-27B-FP8"
 IEEE_FULL_CHAIN_REQUIREMENT = (
     "写作与交付要求：最终论文必须是完整 IEEE 风格英文论文，采用 IEEE 双栏 LaTeX；"
     "正文目标为 8 页（参考文献计入总页数），不得通过重复、空泛背景或放大图表凑页；"
@@ -108,11 +109,11 @@ STAGE_OUTPUTS: dict[int, list[str]] = {
     3: ["search_plan.yaml", "sources.json", "queries.json"],
     4: ["candidates.jsonl", "references.bib", "reference_paper_text.md", "web_context.md", "search_meta.json"],
     5: ["shortlist.jsonl"], 6: ["cards/"], 7: ["synthesis.md", "literature_watch_report.md"], 8: ["hypotheses.md", "core_ideas.md", "hypotheses_raw.md", "challenge_insight_tree.md", "challenge_insight_tree.json", "candidate_ideas.md", "idea_tournament.md", "idea_tournament.json", "idea_role_review.md", "idea_review.md", "idea_pivot.md", "idea_decision_table.md", "ideation_memory_update.md", "idea_evidence_pack.md", "idea_branch_synthesis.md", "idea_branches/", "rag_index.jsonl", "global_rag_index.jsonl", "rag_retrieval_report.json", "citation_graph.json", "idea_quality_scores.json", "idea_quality_summary.md", "novelty_report.json", "idea_selection.json", "discussion_consensus.md"],
-    9: ["exp_plan.yaml", "exp_plan_diagnostics.json"], 10: ["codebase_candidates.json"],
+    9: ["exp_plan.yaml", "exp_plan_diagnostics.json", "compact_design_review.json", "plan_candidate.json", "plan_patch_candidate.json"], 10: ["codebase_candidates.json"],
     11: ["experiment/", "experiment_spec.md"], 12: ["sanity_report.json"],
     13: ["schedule.json"], 14: ["runs/"],
     15: ["refinement_log.json", "experiment_final/"],
-    16: ["analysis.md", "experiment_summary.json", "experiment_provenance.json", "evaluation_protocol_audit.json", "charts/"], 17: ["decision.md", "decision_structured.json", "research_readiness.json"], 18: ["knowledge_entry.json"],
+    16: ["method_probe_results.json", "analysis.md", "experiment_summary.json", "experiment_provenance.json", "evaluation_protocol_audit.json", "charts/"], 17: ["decision.md", "decision_structured.json", "research_readiness.json"], 18: ["knowledge_entry.json"],
     19: ["outline.md"], 20: ["paper_draft.md"], 21: ["reviews.md"], 22: ["paper_revised.md", "latex_package.zip"],
     23: ["quality_report.json", "fabrication_flags.json", "claim_integrity_report.json"],
     24: ["archive.md", "bundle_index.json"],
@@ -120,8 +121,20 @@ STAGE_OUTPUTS: dict[int, list[str]] = {
     26: ["verification_report.json", "references_verified.bib", "paper_final_verified.md"],
 }
 
+for _stage_num, _outputs in STAGE_OUTPUTS.items():
+    _outputs.extend(["research_skill_usage.json", "research_rubric.json", "research_state.json", "research_engine_summary.json", "research_method_plan.json", "research_execution_plan.json"])
+    if _stage_num in (9, 17, 23, 26):
+        _outputs.append("research_verification.json")
+    if _stage_num in (9, 21):
+        _outputs.append("research_council.json")
+
 # Curated artifacts to display in the frontend DataShelf (subset of STAGE_OUTPUTS)
 DISPLAY_ARTIFACTS: set[str] = {
+    'method_probe_results.json',
+    "compact_design_review.json", "plan_candidate.json", "plan_patch_candidate.json",
+    "research_skill_usage.json", "research_rubric.json", "research_verification.json",
+    "research_state.json", "research_engine_summary.json", "research_council.json",
+    "research_execution_plan.json", "research_method_plan.json",
     "search_plan.yaml", "queries.json", "candidates.jsonl", "shortlist.jsonl",
     "cards/", "synthesis.md", "literature_watch_report.md", "references.bib", "reference_paper_text.md",
     "web_context.md", "search_meta.json",
@@ -142,6 +155,10 @@ DISPLAY_ARTIFACTS: set[str] = {
 
 # 这些文件在发送到前端时需要完整内容（不截断），用于展示和导出
 _FULL_CONTENT_ARTIFACTS: set[str] = {
+    'method_probe_results.json',
+    "research_skill_usage.json", "research_rubric.json", "research_verification.json",
+    "research_state.json", "research_engine_summary.json", "research_council.json",
+    "research_execution_plan.json", "research_method_plan.json",
     "synthesis.md", "literature_watch_report.md", "hypotheses.md", "core_ideas.md",
     "challenge_insight_tree.md", "candidate_ideas.md", "idea_tournament.md",
     "idea_role_review.md", "idea_review.md", "idea_pivot.md", "idea_decision_table.md",
@@ -358,7 +375,7 @@ def _init_intent_llm(state: "BridgeState") -> None:
         _intent_llm_client = LLMClient(LLMConfig(
             base_url=base_url,
             api_key=api_key,
-            primary_model=str(section.get("primary_model", DEFAULT_QWEN3_MODEL) or DEFAULT_QWEN3_MODEL),
+            primary_model=str(section.get("primary_model", DEFAULT_RESEARCH_MODEL) or DEFAULT_RESEARCH_MODEL),
             fallback_models=[str(m) for m in fallback_models if str(m).strip()],
             max_retries=1,
             timeout_sec=min(int(section.get("timeout_sec", 30) or 30), 30),
@@ -427,6 +444,12 @@ def _pause_project(state: "BridgeState", project_id: str) -> list[dict]:
     if not project_id:
         return messages
 
+    meta_path = state.projects_dir() / project_id / "project_meta.json"
+    meta = _read_json(meta_path)
+    if isinstance(meta, dict):
+        meta["paused"] = True
+        _write_json(meta_path, meta)
+
     stopped = 0
     for agent in list(state.agents.values()):
         if agent.project_id == project_id:
@@ -445,6 +468,8 @@ def _pause_project(state: "BridgeState", project_id: str) -> list[dict]:
         before = len(q.tasks)
         q.tasks = [t for t in q.tasks if t.project_id != project_id]
         removed += before - len(q.tasks)
+        if before != len(q.tasks):
+            q.save()
 
     released = state.gpu_allocator.release(project_id)
     if released:
@@ -542,6 +567,10 @@ def _restart_project(state: "BridgeState", project_id: str, restart_from: str = 
     if not config_path:
         messages.append(msg_log(sys_agent, f"项目 [{project_id}] 缺少配置文件路径, 无法重启", "error"))
         return messages
+
+    meta.pop("paused", None)
+    meta.pop("intervention", None)
+    _write_json(proj_dir / "project_meta.json", meta)
 
     start_stage, restart_label = RESTART_FROM_OPTIONS.get(
         str(restart_from or "topic"),
@@ -1065,7 +1094,7 @@ class BridgeState:
     discussion_mode: bool = True
     discussion_groups: dict[str, DiscussionGroup] = field(default_factory=dict)
     discussion_rounds: int = 3
-    discussion_models: list[str] = field(default_factory=lambda: [DEFAULT_QWEN3_MODEL])
+    discussion_models: list[str] = field(default_factory=lambda: [DEFAULT_RESEARCH_MODEL])
     # Cross-project discussion: agents waiting for a peer to discuss with
     discussion_waiting: dict[str, "LobsterAgent"] = field(default_factory=dict)
     # Idea factory: L1 idle → produce ideas via S7+S8
@@ -1836,9 +1865,10 @@ def _load_chat_llm_client_from_section(section: dict, state: "BridgeState") -> "
         return LLMClient(LLMConfig(
             base_url=base_url,
             api_key=api_key,
-            primary_model=str(section.get("primary_model", DEFAULT_QWEN3_MODEL) or DEFAULT_QWEN3_MODEL),
+            primary_model=str(section.get("primary_model", DEFAULT_RESEARCH_MODEL) or DEFAULT_RESEARCH_MODEL),
             fallback_models=[str(m) for m in fallback_models if str(m).strip()],
             max_tokens=int(section.get("max_tokens", 4096) or 4096),
+            reasoning_token_reserve=int(section.get("reasoning_token_reserve", 0) or 0),
             timeout_sec=int(section.get("timeout_sec", 90) or 90),
             max_retries=int(section.get("max_retries", 2) or 2),
             extra_body=extra_body,
@@ -1863,7 +1893,7 @@ def _load_root_arc_config() -> dict:
 
 
 def _llm_section_for_model(config_raw: dict, model_name: str) -> dict:
-    selected_model = _coerce_qwen3_model(model_name)
+    selected_model = _coerce_model_name(model_name)
     if not selected_model:
         return {}
 
@@ -1907,7 +1937,7 @@ def _load_project_chat_llm_candidates(
         sections: list[tuple[str, dict]] = []
         project_llm = project_raw.get("llm", {}) or {}
         root_llm = root_raw.get("llm", {}) or {}
-        selected_model = _coerce_qwen3_model(preferred_model) if preferred_model else ""
+        selected_model = _coerce_model_name(preferred_model) if preferred_model else ""
         if selected_model:
             matched_section = _llm_section_for_model(root_raw, selected_model)
             if isinstance(matched_section, dict) and matched_section:
@@ -2057,7 +2087,12 @@ def _sync_completed_stages(
 ) -> list[dict]:
     """Mark all stages from layer_range[0] to done_up_to as completed, emit events for new ones."""
     messages: list[dict] = []
+    checkpoint = _read_json(run_dir / "checkpoint.json") or {}
+    compact = checkpoint.get("workflow") == "compact"
+    actual_stages = set(checkpoint.get("completed_stages", []))
     for s in range(layer_range[0], min(done_up_to, layer_range[1]) + 1):
+        if compact and s not in actual_stages:
+            continue
         if agent.stage_progress.get(s) == "completed":
             continue
         if s not in STAGE_TO_LAYER:
@@ -2065,11 +2100,13 @@ def _sync_completed_stages(
         agent.stage_progress[s] = "completed"
         messages.append(msg_stage_update(agent.id, s, "completed"))
         messages.append(msg_log(agent, f"{STAGE_NAMES.get(s, f'S{s}')} 完成", "success", s))
-        stage_dir = run_dir / f"stage-{s:02d}"
-        if stage_dir.is_dir():
-            for expected in STAGE_OUTPUTS.get(s, []):
+        artifact_stages = {8: [1, 2, 7, 8], 9: [9], 13: [11, 13], 18: [16, 17, 18],
+                           25: [25], 26: [26]}.get(s, [s]) if compact else [s]
+        for artifact_stage in artifact_stages:
+            stage_dir = run_dir / f"stage-{artifact_stage:02d}"
+            for expected in STAGE_OUTPUTS.get(artifact_stage, []):
                 artifact_path = stage_dir / expected.rstrip("/")
-                key = f"{s}:{expected}"
+                key = f"{artifact_stage}:{expected}"
                 if key not in agent._known_artifacts and artifact_path.exists():
                     agent._known_artifacts.add(key)
                     if expected not in DISPLAY_ARTIFACTS:
@@ -2077,7 +2114,7 @@ def _sync_completed_stages(
                     size = "dir" if artifact_path.is_dir() else f"{artifact_path.stat().st_size / 1024:.1f} KB"
                     content = _extract_artifact_summary(artifact_path, expected)
                     messages.append(msg_artifact(
-                        REPO_FOR_STAGE.get(s, "knowledge"), expected, agent.name, size, agent.project_id, content, stage=s,
+                        REPO_FOR_STAGE.get(artifact_stage, "knowledge"), expected, agent.name, size, agent.project_id, content, stage=artifact_stage,
                     ))
     return messages
 
@@ -2091,6 +2128,23 @@ def poll_agent(agent: LobsterAgent) -> list[dict]:
     # Only read heartbeat/checkpoint if THIS agent's process is running,
     # to avoid cross-contamination when multiple agents share a run_dir.
     if agent.process is not None and agent.process.poll() is None:
+        health = _read_json(run_dir / "run_health.json") or {}
+        if health.get("pid") == getattr(agent.process, "pid", None):
+            marker = (health.get("pid"), health.get("phase"), health.get("status"))
+            notice_at = time.monotonic()
+            if (marker != getattr(agent, "_last_health_marker", None)
+                    or notice_at - getattr(agent, '_last_health_notice_at', 0) >= 30):
+                progress = public_run_health(health)
+                messages.append({'type': 'research_progress', 'payload': {
+                    'projectId': agent.project_id, 'health': progress}})
+                labels = {"model_streaming": "模型仍在返回数据，任务有进展", "waiting_provider": "正在等待模型响应",
+                          "computing": "实验或处理程序仍在计算", "quiet_check_required": "长时间没有新输出，已记录诊断并继续检查超时",
+                          "provider_stalled_check_required": "模型响应长时间没有进展，已记录诊断"}
+                status = str(health.get("status", ""))
+                if status in labels:
+                    messages.append(msg_log(agent, labels[status], "warning" if status.endswith("check_required") else "info"))
+                agent._last_health_marker = marker
+                agent._last_health_notice_at = notice_at
         _s7_only = getattr(agent, '_is_idea_factory_s7_only', False)
         layer_range = (7, 7) if _s7_only else LAYER_RANGE.get(agent.layer, (1, 15))
 
@@ -2273,6 +2327,33 @@ def _ensure_full_chain_ieee_config(config_path: str) -> bool:
         return False
 
 
+def _project_agent_dir(state: BridgeState, project_id: str) -> str:
+    """Keep stage workers on the same source revision, including after restart."""
+    project = state.projects_dir() / project_id
+    meta_path = project / "project_meta.json"
+    meta = _read_json(meta_path) or {}
+    pinned = meta.get("engine_dir")
+    if pinned:
+        if not (Path(pinned) / "researchclaw").is_dir():
+            raise ValueError("Pinned project engine is missing; restore its snapshot before resuming")
+        return str(pinned)
+    # Existing checkpoints already bind their original source identity. Never
+    # silently relabel them as outputs from the current development revision.
+    if (not meta_path.is_file() or (project / "checkpoint.json").exists()
+            or any(project.glob("run-*/checkpoint.json"))
+            or not (Path(state.agent_package_dir) / "researchclaw").is_dir()):
+        return state.agent_package_dir
+    from engine_snapshot import freeze_engine
+    pinned_engine = getattr(state, "_pinned_web_engine", None)
+    if pinned_engine is None:
+        pinned_engine = freeze_engine(Path(state.agent_package_dir), Path(state.runs_base_dir) / "engine_snapshots")
+        state._pinned_web_engine = pinned_engine
+    directory, revision = pinned_engine
+    meta.update(engine_dir=str(directory), engine_sha256=revision)
+    _write_json(meta_path, meta)
+    return str(directory)
+
+
 def launch_agent_for_task(state: BridgeState, agent: LobsterAgent, task: Task) -> list[dict]:
     """Assign a task to an agent. Passthrough layers skip process launch."""
     messages: list[dict] = []
@@ -2291,13 +2372,25 @@ def launch_agent_for_task(state: BridgeState, agent: LobsterAgent, task: Task) -
     _task_meta = _read_project_meta(task.run_dir) if task.run_dir else None
     if not _task_meta and task.project_id:
         _task_meta = _read_project_meta(str(state.projects_dir() / task.project_id))
-    _is_reproduce = _task_meta.get("mode") == "reproduce" if _task_meta else False
+    _is_reproduce = _task_meta.get("mode") in {"reproduce", "focused"} if _task_meta else False
     _is_literature_watch = _task_meta.get("run_mode") == "literature_watch" if _task_meta else False
-    if isinstance(_task_meta, dict) and _task_meta.get("run_mode", "full_chain") == "full_chain":
+    try:
+        import yaml as _workflow_yaml
+        _workflow_config = _workflow_yaml.safe_load(Path(task.config_path).read_text()) or {}
+        _task_workflow = (_workflow_config.get("research_engine") or {}).get("workflow", "legacy")
+    except (OSError, ValueError):
+        _task_workflow = "legacy"
+    # Existing interactive ideation and literature-only modes keep their
+    # artifact contracts. Complete new research jobs use the shorter runner.
+    if _is_literature_watch or (_task_meta or {}).get("run_mode") == "idea_gate":
+        _task_workflow = "legacy"
+    _compact = _task_workflow == "compact"
+    if (isinstance(_task_meta, dict) and _task_meta.get("run_mode", "full_chain") == "full_chain"
+            and _task_meta.get("delivery_format", "ieee") == "ieee"):
         _ensure_full_chain_ieee_config(task.config_path)
     if _is_literature_watch and agent.layer == "idea":
         layer_range = LAYER_RANGE_PHASE1["idea"]
-    elif state.discussion_mode and agent.layer == "idea" and not _is_reproduce:
+    elif state.discussion_mode and agent.layer == "idea" and not _is_reproduce and not _compact:
         layer_range = LAYER_RANGE_PHASE1["idea"]
     else:
         layer_range = LAYER_RANGE.get(agent.layer, (1, 15))
@@ -2310,7 +2403,7 @@ def launch_agent_for_task(state: BridgeState, agent: LobsterAgent, task: Task) -
         resume_stage = last_done + 1
 
         # Discussion mode: if S1-S7 already done, skip straight to discussion/S8
-        if state.discussion_mode and agent.layer == "idea" and not _is_reproduce and not _is_literature_watch and last_done >= ts:
+        if state.discussion_mode and agent.layer == "idea" and not _is_reproduce and not _is_literature_watch and not _compact and last_done >= ts:
             for s in range(fs, ts + 1):
                 agent.stage_progress[s] = "completed"
             messages.append(msg_log(
@@ -2356,6 +2449,7 @@ def launch_agent_for_task(state: BridgeState, agent: LobsterAgent, task: Task) -
         "--from-stage", STAGE_NAMES.get(fs, str(fs)),
         "--to-stage", STAGE_NAMES.get(ts, str(ts)),
         "--auto-approve",
+        "--workflow", _task_workflow,
     ]
     if task.topic:
         cmd.extend(["--topic", task.topic])
@@ -2371,7 +2465,7 @@ def launch_agent_for_task(state: BridgeState, agent: LobsterAgent, task: Task) -
         log_path = Path(task.run_dir) / f"agent_{agent.id}.log"
         log_file = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(
-            cmd, cwd=state.agent_package_dir,
+            cmd, cwd=_project_agent_dir(state, task.project_id),
             stdout=log_file, stderr=subprocess.STDOUT,
             env=proc_env,
         )
@@ -2420,6 +2514,7 @@ def _save_project_meta(
     mode: str = "lab",
     user_id: str = "",
     run_mode: str = "full_chain",
+    delivery_format: str = "ieee",
 ) -> None:
     """Persist project metadata so it can be recovered on restart."""
     meta = {
@@ -2428,6 +2523,7 @@ def _save_project_meta(
         "topic": topic,
         "mode": mode,
         "run_mode": run_mode,
+        "delivery_format": delivery_format,
         "user_id": user_id,
         "created_at": _now_ms(),
     }
@@ -2476,6 +2572,8 @@ def _enqueue_checkpoint_retry(
 ) -> list[dict]:
     """Durably requeue an interrupted project from its last checkpoint."""
     if not agent.project_id or not agent.run_dir or not agent.config_path:
+        return []
+    if (_read_json(state.projects_dir() / agent.project_id / "project_meta.json") or {}).get("paused"):
         return []
     if _completed_terminal_stage(agent.run_dir):
         return []
@@ -2541,6 +2639,8 @@ def _recover_orphaned_inflight_projects(state: BridgeState) -> int:
             if child.is_dir() and child.name.startswith("run-")
         )
         project_meta = _read_project_meta(str(project_dir)) or {}
+        if project_meta.get("paused"):
+            continue
         for run_dir in candidates:
             heartbeat = _read_json(run_dir / "heartbeat.json") or {}
             checkpoint = _read_json(run_dir / "checkpoint.json") or {}
@@ -2672,6 +2772,7 @@ def submit_new_project(
     mode: str = "lab",
     user_id: str = "",
     run_mode: str = "full_chain",
+    delivery_format: str = "ieee",
 ) -> list[dict]:
     """Submit a project — auto-detects checkpoint and resumes from where it left off.
 
@@ -2683,7 +2784,7 @@ def submit_new_project(
 
     run_dir = str(state.projects_dir() / project_id)
     os.makedirs(run_dir, exist_ok=True)
-    _save_project_meta(run_dir, project_id, config_path, topic, mode=mode, user_id=user_id, run_mode=run_mode)
+    _save_project_meta(run_dir, project_id, config_path, topic, mode=mode, user_id=user_id, run_mode=run_mode, delivery_format=delivery_format)
 
     if state.discussion_mode:
         messages.append(msg_log(
@@ -2844,8 +2945,9 @@ def on_agent_done(state: BridgeState, agent: LobsterAgent) -> list[dict]:
     # Reproduce mode skips discussion entirely
     _agent_proj_dir = state.projects_dir() / agent.project_id if agent.project_id else None
     _agent_meta = _read_project_meta(str(_agent_proj_dir)) if _agent_proj_dir and _agent_proj_dir.exists() else None
-    _agent_is_reproduce = _agent_meta.get("mode") == "reproduce" if _agent_meta else False
-    if state.discussion_mode and agent.layer == "idea" and not _agent_is_reproduce:
+    _agent_is_reproduce = _agent_meta.get("mode") in {"reproduce", "focused"} if _agent_meta else False
+    _compact_run = (_read_json(Path(agent.run_dir) / "checkpoint.json") or {}).get("workflow") == "compact" if agent.run_dir else False
+    if state.discussion_mode and agent.layer == "idea" and not _agent_is_reproduce and not _compact_run:
         state.discussion_waiting[agent.id] = agent
         agent.current_stage = DISCUSSION_STAGE
         agent.stage_progress[DISCUSSION_STAGE] = "running"
@@ -3106,6 +3208,7 @@ def list_all_projects(state: BridgeState, for_user_id: str = "") -> list[dict]:
                 continue
 
         # Read checkpoint: top-level first, then aggregate from sub-runs (Lab mode)
+        health_dir = proj_dir
         cp = _read_json(proj_dir / "checkpoint.json")
         has_started_artifacts = any(
             child.is_dir() and child.name.startswith("stage-")
@@ -3124,6 +3227,7 @@ def list_all_projects(state: BridgeState, for_user_id: str = "") -> list[dict]:
                     if sub_cp and sub_cp.get("last_completed_stage", 0) > best_stage:
                         best_stage = sub_cp.get("last_completed_stage", 0)
                         best_cp = sub_cp
+                        health_dir = sub
             cp = best_cp
 
         last_stage = cp.get("last_completed_stage", 0) if cp else 0
@@ -3141,6 +3245,8 @@ def list_all_projects(state: BridgeState, for_user_id: str = "") -> list[dict]:
 
         if last_stage >= completed_threshold:
             status = "completed"
+        elif (meta or {}).get("paused"):
+            status = "paused"
         elif project_is_running:
             status = "running"
         elif project_id in queued_project_ids:
@@ -3182,11 +3288,15 @@ def list_all_projects(state: BridgeState, for_user_id: str = "") -> list[dict]:
             "lastCompletedName": last_name,
             "firstStage": first_stage,
             "totalStages": total_stages,
+            "workflow": (cp or {}).get("workflow", "legacy"),
+            "completedPhases": (cp or {}).get("completed_phases", []),
+            'runHealth': public_run_health(_read_json(health_dir / 'run_health.json') or {}),
             "timestamp": timestamp,
             "topic": topic,
             "configPath": config_path,
             "intervention": intervention,
             "runMode": (meta or {}).get("run_mode", "full_chain"),
+            "deliveryFormat": (meta or {}).get("delivery_format", "ieee"),
             "user_id": (meta or {}).get("user_id", ""),
         })
 
@@ -3216,6 +3326,8 @@ def resume_project(state: BridgeState, project_id: str) -> list[dict]:
     mode = meta.get("mode", "lab") if meta else "lab"
 
     # Clear intervention flag on resume
+    if meta and meta.pop("paused", False):
+        _write_json(proj_dir / "project_meta.json", meta)
     if meta and meta.get("intervention"):
         meta.pop("intervention", None)
         try:
@@ -3360,6 +3472,7 @@ def _generate_config_from_template(
     model_name: str = "",
     idea_count: int = 5,
     target_conference: str = "",
+    reference_purpose: str = "background",
 ) -> str:
     """Generate a project-specific YAML config from the default template.
 
@@ -3379,77 +3492,60 @@ def _generate_config_from_template(
     if target_conference == "ieee":
         full_topic += f"\n\n{IEEE_FULL_CHAIN_REQUIREMENT}"
 
-    content = template_path.read_text(encoding="utf-8")
-    content = content.replace("__PROJECT_ID__", project_id)
-    content = content.replace("__TOPIC__", full_topic.replace('"', '\\"'))
+    import yaml as _yaml
 
-    if reference_papers:
-        yaml_list = "\n".join(f'    - "{p}"' for p in reference_papers)
-        content = content.replace("  reference_papers: __REFERENCE_PAPERS__",
-                                  f"  reference_papers:\n{yaml_list}")
-    else:
-        content = content.replace("  reference_papers: __REFERENCE_PAPERS__",
-                                  "  reference_papers: []")
-    content = content.replace(
-        "  reference_papers: []",
-        f"  reference_papers: []\n  paper_source_mode: \"{paper_source_mode}\"",
-        1,
-    ) if "paper_source_mode:" not in content else content
-    content = content.replace(
-        f"  reference_papers:\n{yaml_list}" if reference_papers else "",
-        (f"  reference_papers:\n{yaml_list}\n  paper_source_mode: \"{paper_source_mode}\""
-         if reference_papers and f"  reference_papers:\n{yaml_list}" in content else ""),
-        1,
-    ) if reference_papers and "paper_source_mode:" not in content else content
+    # Parse the template before inserting user input. YAML serialization must
+    # preserve quotes, newlines, backslashes and reference paths exactly.
+    template_text = template_path.read_text(encoding="utf-8").replace("__REFERENCE_PAPERS__", "[]")
+    raw_cfg = _yaml.safe_load(template_text)
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("Research project template must be a mapping")
+    raw_cfg.setdefault("project", {})["name"] = project_id
+    research_cfg = raw_cfg.setdefault("research", {})
+    research_cfg.update(topic=full_topic, reference_papers=list(reference_papers or []),
+                        paper_source_mode=paper_source_mode, reference_purpose=reference_purpose,
+                        idea_count=max(1, min(8, int(idea_count or 5))))
+    # New web tasks infer their domain from their own request, rather than
+    # inheriting the example template's deep-learning domain.
+    research_cfg["domains"] = []
+    experiment_cfg = raw_cfg.setdefault("experiment", {})
+    for key, value in (("codebases_dir", codebases_dir), ("datasets_dir", datasets_dir),
+                       ("checkpoints_dir", checkpoints_dir)):
+        if value:
+            experiment_cfg[key] = value
 
-    import re as _re
-    if codebases_dir:
-        content = _re.sub(r'(codebases_dir:\s*)"[^"]*"', f'\\1"{codebases_dir}"', content)
-    if datasets_dir:
-        content = _re.sub(r'(datasets_dir:\s*)"[^"]*"', f'\\1"{datasets_dir}"', content)
-    if checkpoints_dir:
-        content = _re.sub(r'(checkpoints_dir:\s*)"[^"]*"', f'\\1"{checkpoints_dir}"', content)
-    selected_model = _coerce_qwen3_model(model_name) if model_name else DEFAULT_QWEN3_MODEL
+    root_cfg = _load_root_arc_config()
+    root_engine = root_cfg.get("research_engine", {}) if isinstance(root_cfg, dict) else {}
+    engine_cfg = raw_cfg.setdefault("research_engine", {})
+    if isinstance(root_engine, dict) and isinstance(engine_cfg, dict):
+        engine_cfg.update({key: value for key, value in root_engine.items() if key in engine_cfg})
+
+    selected_model = _coerce_model_name(model_name) if model_name else DEFAULT_RESEARCH_MODEL
     if selected_model:
-        root_section = _llm_section_for_model(_load_root_arc_config(), selected_model)
+        root_section = _llm_section_for_model(root_cfg, selected_model)
         if root_section:
-            import yaml as _yaml
-
-            raw = _yaml.safe_load(content) or {}
-            llm_raw = raw.setdefault("llm", {})
+            llm_raw = raw_cfg.setdefault("llm", {})
             if isinstance(llm_raw, dict):
                 for key in (
                     "provider", "base_url", "api_key", "api_key_env", "timeout_sec",
-                    "max_retries", "max_tokens", "strip_thinking", "extra_body",
+                    "max_retries", "max_tokens", "reasoning_token_reserve", "strip_thinking", "extra_body",
                 ):
                     if key in root_section:
                         llm_raw[key] = root_section[key]
-                llm_raw["primary_model"] = selected_model
-                llm_raw["coding_model"] = selected_model
-                llm_raw["fallback_models"] = []
-            content = _yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
+                llm_raw.update(primary_model=selected_model, coding_model=selected_model, fallback_models=[])
         else:
-            print(f"[config] selected model has no configured endpoint, keeping template defaults: {selected_model}")
+            if root_cfg.get("llm"):
+                raise ValueError(f"Selected model has no configured endpoint: {selected_model}")
 
-    import yaml as _yaml
-    try:
-        raw_cfg = _yaml.safe_load(content) or {}
-        research_cfg = raw_cfg.setdefault("research", {})
-        research_cfg["idea_count"] = max(1, min(8, int(idea_count or 5)))
-        inferred_metric = _infer_experiment_metric(topic)
-        if inferred_metric:
-            experiment_cfg = raw_cfg.setdefault("experiment", {})
-            experiment_cfg["metric_key"], experiment_cfg["metric_direction"] = inferred_metric
-        if target_conference:
-            export_cfg = raw_cfg.setdefault("export", {})
-            export_cfg["target_conference"] = target_conference
-            if target_conference == "ieee":
-                export_cfg["target_pages"] = 8
-                export_cfg["min_pages"] = 7
-                export_cfg["max_pages"] = 8
-        content = _yaml.safe_dump(raw_cfg, sort_keys=False, allow_unicode=True)
-    except Exception:
-        pass
+    inferred_metric = _infer_experiment_metric(topic)
+    if inferred_metric:
+        experiment_cfg["metric_key"], experiment_cfg["metric_direction"] = inferred_metric
+    if target_conference:
+        export_cfg = raw_cfg.setdefault("export", {})
+        export_cfg["target_conference"] = target_conference
+        if target_conference == "ieee":
+            export_cfg.update(target_pages=8, min_pages=7, max_pages=8)
+    content = _yaml.safe_dump(raw_cfg, sort_keys=False, allow_unicode=True)
 
     configs_dir = Path(state.runs_base_dir) / "project_configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
@@ -3475,14 +3571,12 @@ def _sanitize_model_name(model_name: str) -> str:
     return model
 
 
-def _is_qwen3_model(model_name: str) -> bool:
-    model = str(model_name or "").lower()
-    return "qwen3" in model or "qwen-3" in model
 
-
-def _coerce_qwen3_model(model_name: str) -> str:
+def _coerce_model_name(model_name: str) -> str:
+    if os.environ.get('EMNETS_PROVIDER_LOCK', '').lower() in {'1', 'true', 'yes'}:
+        return os.environ.get('EMNETS_MODEL', DEFAULT_RESEARCH_MODEL)
     model = _sanitize_model_name(model_name)
-    return model if _is_qwen3_model(model) else DEFAULT_QWEN3_MODEL
+    return model or DEFAULT_RESEARCH_MODEL
 
 
 def _persist_reference_uploads(
@@ -3726,6 +3820,7 @@ def quick_submit_project(
     user_id: str = "",
     idea_count: int = 5,
     run_mode: str = "full_chain",
+    delivery_format: str = "ieee",
 ) -> list[dict]:
     """Create a project from a topic string.
 
@@ -3747,12 +3842,15 @@ def quick_submit_project(
     run_mode = (run_mode or "full_chain").strip().lower()
     if run_mode not in {"full_chain", "idea_gate"}:
         run_mode = "full_chain"
-    selected_model = _coerce_qwen3_model(model_name)
+    if mode not in {"lab", "reproduce", "focused"} or delivery_format not in {"report", "ieee"}:
+        return [msg_log(sys_agent, "请选择有效的研究方式与交付形式", "error")]
+    conference = "ieee" if run_mode == "full_chain" and delivery_format == "ieee" else ""
+    selected_model = _coerce_model_name(model_name)
 
     base_id = project_id or _slugify(topic)
 
     # ── Reproduce mode: single-agent standard pipeline ──
-    if mode == "reproduce":
+    if mode in {"reproduce", "focused"}:
         if not project_id:
             existing = state.projects_dir() / base_id
             if existing.exists():
@@ -3771,21 +3869,23 @@ def quick_submit_project(
             config_path = _generate_config_from_template(
                 state, base_id, topic.strip(),
                 reference_papers=all_reference_papers,
+                reference_purpose="reproduction" if mode == "reproduce" else "background",
                 paper_source_mode=submission_mode,
                 codebases_dir=_po.get("codebases_dir", ""),
                 datasets_dir=_po.get("datasets_dir", ""),
                 checkpoints_dir=_po.get("checkpoints_dir", ""),
                 model_name=selected_model,
                 idea_count=idea_count,
-                target_conference="ieee" if run_mode == "full_chain" else "",
+                target_conference=conference,
             )
         except Exception as e:
             messages.append(msg_log(sys_agent, f"配置生成失败: {e}", "error"))
             return messages
         if saved_reference_paths:
             messages.append(msg_log(sys_agent, f"已接收 {len(saved_reference_paths)} 个本地 PDF 参考文件", "info"))
-        messages.append(msg_log(sys_agent, f"复现模式: 项目 [{base_id}] 单 Agent 全流程启动", "success"))
-        messages.extend(submit_new_project(state, base_id, config_path, topic.strip(), mode="reproduce", user_id=user_id, run_mode=run_mode))
+        label = "复现研究" if mode == "reproduce" else "专注研究"
+        messages.append(msg_log(sys_agent, f"{label}: 项目 [{base_id}] 单流程启动", "success"))
+        messages.extend(submit_new_project(state, base_id, config_path, topic.strip(), mode=mode, user_id=user_id, run_mode=run_mode, delivery_format=delivery_format))
         return messages
 
     # ── Lab mode: parallel research (ONE project, N agents — or 1 agent if single direction) ──
@@ -3824,13 +3924,13 @@ def quick_submit_project(
             checkpoints_dir=_po.get("checkpoints_dir", ""),
             model_name=selected_model,
             idea_count=idea_count,
-            target_conference="ieee" if run_mode == "full_chain" else "",
+            target_conference=conference,
         )
     except Exception as e:
         messages.append(msg_log(sys_agent, f"配置生成失败: {e}", "error"))
         return messages
 
-    _save_project_meta(str(project_dir), base_id, project_config_path, topic.strip(), mode="lab", user_id=user_id, run_mode=run_mode)
+    _save_project_meta(str(project_dir), base_id, project_config_path, topic.strip(), mode="lab", user_id=user_id, run_mode=run_mode, delivery_format=delivery_format)
 
     messages.append(msg_log(
         sys_agent,
@@ -3861,7 +3961,7 @@ def quick_submit_project(
                 checkpoints_dir=_po.get("checkpoints_dir", ""),
                 model_name=selected_model,
                 idea_count=idea_count,
-                target_conference="ieee" if run_mode == "full_chain" else "",
+                target_conference=conference,
             )
         except Exception as e:
             messages.append(msg_log(sys_agent, f"配置生成失败 [{name}]: {e}", "error"))
@@ -3907,7 +4007,7 @@ def quick_submit_project(
 def _create_model_config(base_config_path: str, model_name: str, output_dir: str) -> str:
     """Create a per-agent config file with a different primary_model."""
     import yaml
-    model_name = _coerce_qwen3_model(model_name)
+    model_name = _coerce_model_name(model_name)
     with open(base_config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if "llm" in cfg:
@@ -3979,7 +4079,7 @@ def _launch_idea_factory_run(state: BridgeState, agent: LobsterAgent, s7_only: b
         log_path = Path(run_dir) / f"agent_{agent.id}.log"
         log_file = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(
-            cmd, cwd=state.agent_package_dir,
+            cmd, cwd=_project_agent_dir(state, agent.project_id),
             stdout=log_file, stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
@@ -4276,7 +4376,7 @@ def _skip_discussion_proceed_s8(state: BridgeState, agent: LobsterAgent) -> list
         log_path = Path(agent.run_dir) / f"agent_{agent.id}_s8.log"
         log_file = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(
-            cmd, cwd=state.agent_package_dir,
+            cmd, cwd=_project_agent_dir(state, agent.project_id),
             stdout=log_file, stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
@@ -4448,7 +4548,7 @@ def _launch_s8_for_agent(state: BridgeState, agent: LobsterAgent, group: Discuss
         log_path = Path(agent.run_dir) / f"agent_{agent.id}_s8.log"
         log_file = open(log_path, "w", encoding="utf-8")
         proc = subprocess.Popen(
-            cmd, cwd=state.agent_package_dir,
+            cmd, cwd=_project_agent_dir(state, agent.project_id),
             stdout=log_file, stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
@@ -4680,10 +4780,11 @@ def schedule_idle_agents(state: BridgeState) -> list[dict]:
             task = queue.peek_pending()
             if not task or task.target_layer != agent.layer:
                 continue
-            if state._fail_counts.get(task.project_id, 0) >= 3:
+            meta = _read_json(state.projects_dir() / task.project_id / "project_meta.json") or {}
+            if state._fail_counts.get(task.project_id, 0) >= 3 or meta.get("paused") or meta.get("intervention"):
+                task.status = "cancelled"
+                queue.save()
                 continue
-
-            state._fail_counts.pop(task.project_id, None)  # reset on successful assignment
             queue.assign(task.id, agent.id)
             messages.extend(launch_agent_for_task(state, agent, task))
             messages.append(msg_queue_update(state.queues))
@@ -4865,7 +4966,7 @@ def _finalize_literature_schedule(state: BridgeState, schedule: dict) -> bool:
             lines.append(f"- [{item.get('title')}]({url})" + (f" — {suffix}" if suffix else ""))
     else:
         lines.append("- 本周期没有发现未收录的新论文。")
-    lines.extend(["", "## Qwen3 文献综述", "", synthesis or "本次未生成有效综述。", ""])
+    lines.extend(["", "## 文献综述", "", synthesis or "本次未生成有效综述。", ""])
     report_path.write_text("\n".join(lines), encoding="utf-8")
     shutil.copy2(report_path, report_dir / report_path.name)
     schedule["lastReportPath"] = str(report_path)
@@ -4900,7 +5001,7 @@ def _dispatch_literature_schedule(state: BridgeState, schedule: dict) -> list[di
     project_id = f"literature-watch-{schedule['id']}-{stamp}-{_uid()}"
     config_path = _generate_config_from_template(
         state, project_id, prompt_topic,
-        paper_source_mode="auto", model_name=DEFAULT_QWEN3_MODEL, idea_count=1,
+        paper_source_mode="auto", model_name=DEFAULT_RESEARCH_MODEL, idea_count=1,
     )
     messages = submit_new_project(
         state, project_id, config_path, prompt_topic,
@@ -5015,8 +5116,23 @@ async def handle_command(state: BridgeState, data: dict, websocket: object | Non
         messages.append({"type": "auth_result", "payload": {"ok": True, "authenticated": False}})
         return messages
 
+    if cmd == 'get_workspace_overview':
+        if not user_id:
+            return [{'type': 'workspace_overview_error', 'payload': {'message': '请先登录后查看工作空间'}}]
+        from workspace_overview import workspace_overview
+        projects = await asyncio.to_thread(list_all_projects, state, for_user_id=user_id)
+        messages.append({'type': 'workspace_overview', 'payload': workspace_overview(projects)})
+
+    elif cmd == 'get_research_capabilities':
+        from research_capabilities import capabilities
+        try:
+            snapshot = await asyncio.to_thread(capabilities, data.get('topic', ''), data.get('stage', 9))
+            messages.append({'type': 'research_capabilities', 'payload': snapshot})
+        except (ValueError, TypeError) as exc:
+            messages.append({'type': 'research_capabilities_error', 'payload': {'message': str(exc)}})
+
     # ── 定期文献追踪 ──
-    if cmd == "list_literature_schedules":
+    elif cmd == "list_literature_schedules":
         messages.append(_schedule_list_message(state, user_id))
 
     elif cmd == "create_literature_schedule":
@@ -5234,7 +5350,8 @@ async def handle_command(state: BridgeState, data: dict, websocket: object | Non
             "datasets_dir": data.get("datasetsDir", ""),
             "checkpoints_dir": data.get("checkpointsDir", ""),
         }
-        messages.extend(quick_submit_project(state, topic, project_id, mode, submission_mode, angles, ref_papers, reference_files, path_overrides, model_name, user_id=user_id, idea_count=idea_count, run_mode=run_mode))
+        delivery_format = str(data.get("deliveryFormat", "ieee"))
+        messages.extend(quick_submit_project(state, topic, project_id, mode, submission_mode, angles, ref_papers, reference_files, path_overrides, model_name, user_id=user_id, idea_count=idea_count, run_mode=run_mode, delivery_format=delivery_format))
         messages.extend(schedule_idle_agents(state))
         messages.append(msg_project_list(list_all_projects(state, for_user_id=user_id)))
 
@@ -5689,6 +5806,11 @@ async def poll_loop(state: BridgeState, interval: float):
                         all_messages.append(msg_log(agent, f"GPU {released} 已释放 (错误后)", "warning"))
 
                 if _n_fails >= _MAX_RETRIES:
+                    meta_path = state.projects_dir() / _fail_pid / "project_meta.json"
+                    meta = _read_json(meta_path) or {}
+                    if meta_path.exists():
+                        meta["intervention"] = "retry_limit:连续失败 3 次，自动重试已停止，请检查日志后手动恢复"
+                        _write_json(meta_path, meta)
                     all_messages.append(msg_log(
                         agent,
                         f"项目 [{_fail_pid}] 连续失败 {_n_fails} 次，已停止自动重试。请检查日志后手动恢复。",
@@ -5760,10 +5882,10 @@ async def main(args: argparse.Namespace):
         discussion_mode=args.discussion_mode,
         discussion_rounds=args.discussion_rounds,
         discussion_models=[
-            _coerce_qwen3_model(m)
+            _coerce_model_name(m)
             for m in args.discussion_models.split(",")
             if m.strip()
-        ] or [DEFAULT_QWEN3_MODEL],
+        ] or [DEFAULT_RESEARCH_MODEL],
         idea_factory_topic=args.idea_topic,
         idea_factory_config=args.idea_config,
         idea_factory_remaining=args.idea_count,
@@ -5869,61 +5991,24 @@ async def main(args: argparse.Namespace):
             return WSResponse(status_code, reason, websockets.Headers(headers), body)
 
         async def process_request(connection, request):
+            if request.path == '/health':
+                return _http_response(200, b'{"status":"ok","service":"emnets-projects"}', 'application/json')
             if request.path.startswith("/download/"):
-                from urllib.parse import unquote
-                parts = unquote(request.path[len("/download/"):]).split("/", 1)
+                from urllib.parse import unquote, urlsplit
+                from project_downloads import project_download
+                parts = unquote(urlsplit(request.path).path[len("/download/"):]).split("/", 1)
                 if len(parts) < 2:
                     return _http_response(404, b"Not found\n")
-                project_id, filename = parts[0], parts[1]
-                proj_dir = Path(st.runs_base_dir) / "projects" / project_id
-                file_path = None
-                search_roots: list[Path] = []
-                if proj_dir.is_dir():
-                    search_roots.append(proj_dir)
-                cross_proj_dir = Path(st.runs_base_dir) / "projects" / "_cross_discussions" / project_id
-                if cross_proj_dir.is_dir():
-                    search_roots.append(cross_proj_dir)
-                if not search_roots:
-                    return _http_response(404, f"Project {project_id} not found\n".encode())
-
-                for root_dir in search_roots:
-                    candidate = root_dir / "deliverables" / filename
-                    if candidate.is_file():
-                        file_path = candidate
-                        break
-                    for deliverables_dir in sorted(root_dir.glob("run-*/deliverables"), reverse=True):
-                        candidate = deliverables_dir / filename
-                        if candidate.is_file():
-                            file_path = candidate
-                            break
-                    if file_path:
-                        break
-                    for stage_dir in sorted(root_dir.glob("run-*/stage-*"), reverse=True):
-                        candidate = stage_dir / filename
-                        if candidate.is_file():
-                            file_path = candidate
-                            break
-                    if file_path:
-                        break
-                    for discussion_dir in sorted(root_dir.glob("run-*/discussion"), reverse=True):
-                        candidate = discussion_dir / filename
-                        if candidate.is_file():
-                            file_path = candidate
-                            break
-                    if file_path:
-                        break
-                    candidate = root_dir / "discussion" / filename
-                    if candidate.is_file():
-                        file_path = candidate
-                        break
-                if not file_path:
-                    return _http_response(404, f"File {filename} not found\n".encode())
                 try:
-                    data = file_path.read_bytes()
-                    return _http_response(200, data, "application/octet-stream",
-                                          {"Content-Disposition": f'attachment; filename="{file_path.name}"'})
-                except Exception as e:
-                    return _http_response(500, f"Error: {e}\n".encode())
+                    result = project_download(st.projects_dir(), parts[0], parts[1])
+                    if result is None:
+                        return _http_response(404, b"Project artifact not found\n")
+                    data, content_type, disposition = result
+                    return _http_response(200, data, content_type, {"Content-Disposition": disposition})
+                except ValueError as exc:
+                    return _http_response(413, str(exc).encode("utf-8"))
+                except OSError:
+                    return _http_response(404, b"Artifact is no longer available\n")
             return None
         return process_request
 
@@ -5962,8 +6047,8 @@ if __name__ == "__main__":
                         help="Disable L1 discussion mode")
     parser.add_argument("--discussion-rounds", type=int, default=3,
                         help="Number of LLM discussion rounds (default: 3)")
-    parser.add_argument("--discussion-models", default=DEFAULT_QWEN3_MODEL,
-                        help="Comma-separated Qwen3 models for discussion agents")
+    parser.add_argument("--discussion-models", default=DEFAULT_RESEARCH_MODEL,
+                        help="Comma-separated configured models for discussion agents")
     parser.add_argument("--idea-count", type=int, default=0,
                         help="Idea factory: number of ideas to produce (0=disabled, -1=infinite)")
     parser.add_argument("--idea-topic", default="",

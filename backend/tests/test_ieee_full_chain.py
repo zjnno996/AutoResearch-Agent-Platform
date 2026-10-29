@@ -123,8 +123,8 @@ def test_full_chain_config_enforces_ieee_and_real_experiment_delivery(tmp_path: 
     assert "IEEE 双栏 LaTeX" in topic
     assert "真实运行记录" in topic
     assert "不得编造实验数据" in topic
-    assert config["llm"]["primary_model"].lower().startswith("qwen3")
-    assert config["llm"]["coding_model"].lower().startswith("qwen3")
+    assert config["llm"]["primary_model"] == "Qwen3.8-27B-FP8"
+    assert config["llm"]["coding_model"] == "Qwen3.8-27B-FP8"
 
 
 def test_generated_config_infers_higher_is_better_metric(tmp_path: Path) -> None:
@@ -238,7 +238,7 @@ def test_codegen_constraints_use_plan_seed_contract() -> None:
 
     system_prompt = build_system_prompt(context)
     user_prompt = build_user_message(context)
-    assert "do NOT introduce a pretrained neural model" in user_prompt
+    assert "A pretrained neural model is required only when the executable plan explicitly calls for one" in user_prompt
     assert "Use REAL pretrained models" not in system_prompt
     assert "Use exactly 3 seeds (11, 29, 47)" in user_prompt
     assert "FID via torchmetrics" not in user_prompt

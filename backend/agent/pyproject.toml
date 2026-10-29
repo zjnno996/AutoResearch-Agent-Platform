@@ -1,7 +1,7 @@
 [project]
 name = "researchclaw"
 version = "0.3.1"
-description = "ResearchClaw — Autonomous Research Pipeline. Turn any research idea into a paper."
+description = "Research runtime for EMNETS-RA (EMNETS Research Assistant)."
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml>=6.0",
@@ -9,7 +9,7 @@ dependencies = [
     "arxiv>=2.1",
     "numpy>=1.24",
 ]
-readme = "../../README.md"
+readme = "README.md"
 license = {text = "MIT"}
 
 [project.optional-dependencies]
@@ -27,16 +27,14 @@ all = [
     "matplotlib>=3.7",
     "scipy>=1.10",
 ]
-dev = ["pytest>=7.0", "httpx>=0.24"]
+dev = ["pytest>=7.0", "httpx>=0.24", "jsonschema>=4.23,<5"]
 
 [project.scripts]
+emnets-ra = "researchclaw.cli:main"
 researchclaw = "researchclaw.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["researchclaw", "sibyl", "arc"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"researchclaw/templates/styles" = "researchclaw/templates/styles"
 
 [build-system]
 requires = ["hatchling"]

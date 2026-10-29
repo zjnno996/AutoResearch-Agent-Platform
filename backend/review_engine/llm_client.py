@@ -15,7 +15,7 @@ if str(AGENT_DIR) not in sys.path:
 _llm_clients: dict[str, Any] = {}
 _llm_configs: list[dict[str, Any]] = []
 _llm_model_options: list[dict[str, str]] = []
-_primary_model_name: str = "deepseek-v4-pro"
+_primary_model_name: str = "Qwen3.8-27B-FP8"
 
 
 def _load_config() -> dict[str, Any]:
@@ -53,7 +53,7 @@ def _build_model_configs() -> None:
         or os.environ.get(str(web_llm.get("api_key_env", "RESEARCHCLAW_API_KEY")), "")
         or ""
     )
-    primary_model = str(web_llm.get("primary_model", "deepseek-v4-pro") or "deepseek-v4-pro")
+    primary_model = str(web_llm.get("primary_model", "Qwen3.8-27B-FP8") or "Qwen3.8-27B-FP8")
     extra_body = web_llm.get("extra_body", {}) or {}
     timeout_sec = int(web_llm.get("timeout_sec", 120) or 120)
     max_retries = int(web_llm.get("max_retries", 2) or 2)
@@ -65,7 +65,8 @@ def _build_model_configs() -> None:
     model_options: list[dict[str, str]] = []
 
     def add_model(model: str, base: str, key: str, prov: str, extra: dict,
-                  timeout: int, retries: int, strip: bool, label_prefix: str = ""):
+                  timeout: int, retries: int, strip: bool, label_prefix: str = "",
+                  max_tokens: int = 4096, reasoning_token_reserve: int = 0):
         if not model:
             return
         normalized_base = base.rstrip("/")
@@ -91,12 +92,16 @@ def _build_model_configs() -> None:
             "timeout_sec": timeout,
             "max_retries": retries,
             "strip_thinking": strip,
+            "max_tokens": max_tokens,
+            "reasoning_token_reserve": reasoning_token_reserve,
             "fallback_url": "",
             "fallback_api_key": "",
         })
 
     add_model(primary_model, base_url, api_key, provider, extra_body,
-              timeout_sec, max_retries, strip_thinking)
+              timeout_sec, max_retries, strip_thinking,
+              max_tokens=int(web_llm.get("max_tokens", 4096)),
+              reasoning_token_reserve=int(web_llm.get("reasoning_token_reserve", 0)))
 
     if isinstance(fallbacks, list):
         for fb in fallbacks:
@@ -116,7 +121,9 @@ def _build_model_configs() -> None:
             fb_strip = fb.get("strip_thinking", strip_thinking)
             fb_label = str(fb.get("label", "") or "")
             add_model(fb_model, fb_base, fb_key, fb_provider, fb_extra,
-                      fb_timeout, fb_retries, fb_strip, fb_label)
+                      fb_timeout, fb_retries, fb_strip, fb_label,
+                      max_tokens=int(fb.get("max_tokens", web_llm.get("max_tokens", 4096))),
+                      reasoning_token_reserve=int(fb.get("reasoning_token_reserve", web_llm.get("reasoning_token_reserve", 0))))
 
     _llm_configs = configs
     _llm_model_options = model_options
@@ -187,6 +194,8 @@ def register_config_section(section_name: str) -> str | None:
                 "timeout_sec": timeout_sec,
                 "max_retries": max_retries,
                 "strip_thinking": strip_thinking,
+                "max_tokens": int(section.get("max_tokens", 4096)),
+                "reasoning_token_reserve": int(section.get("reasoning_token_reserve", 0)),
                 "fallback_url": fallback_url,
                 "fallback_api_key": fallback_api_key,
             }
@@ -209,6 +218,8 @@ def register_config_section(section_name: str) -> str | None:
         "timeout_sec": timeout_sec,
         "max_retries": max_retries,
         "strip_thinking": strip_thinking,
+        "max_tokens": int(section.get("max_tokens", 4096)),
+        "reasoning_token_reserve": int(section.get("reasoning_token_reserve", 0)),
         "fallback_url": fallback_url,
         "fallback_api_key": fallback_api_key,
     })
@@ -247,6 +258,8 @@ def get_client_for_model(model_name: str | None = None) -> Any:
         api_key=cfg["api_key"],
         primary_model=cfg["model"],
         fallback_models=[],
+        max_tokens=cfg.get("max_tokens", 4096),
+        reasoning_token_reserve=cfg.get("reasoning_token_reserve", 0),
         timeout_sec=cfg["timeout_sec"],
         max_retries=cfg["max_retries"],
         extra_body=cfg["extra_body"],
@@ -275,11 +288,5 @@ def get_primary_model_name() -> str:
 
 
 def get_preferred_review_model_name() -> str:
-    """Prefer the configured Qwen model for multimodal review and debate."""
-    if not _llm_model_options:
-        _build_model_configs()
-    for option in _llm_model_options:
-        value = option.get("value", "")
-        if "qwen" in value.lower():
-            return value
-    raise RuntimeError("AutoReview requires a configured Qwen model")
+    """Use the configured review model for multimodal review and debate."""
+    return register_config_section("review_llm") or get_primary_model_name()

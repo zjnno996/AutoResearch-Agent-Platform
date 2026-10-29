@@ -16,8 +16,6 @@ import json
 import logging
 import os
 import time
-import urllib.error
-import urllib.request
 import yaml
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -178,10 +176,14 @@ class ClawTurnLoop:
         bash_timeout: int = 60,
         max_iterations: int = MAX_ITERATIONS,
         python_path: str = "",
+        checkpoints_dir: str = "",
     ) -> None:
         self._llm_config = llm_config
         self._workspace = workspace
-        self._system_prompt = system_prompt
+        self._checkpoints_dir = checkpoints_dir
+        from researchclaw.orchestration.context import augment_system, skill_read_directories
+        self._system_prompt = augment_system(system_prompt) or system_prompt
+        allowed_read_dirs = [*(allowed_read_dirs or []), *(Path(p).expanduser().resolve() for p in skill_read_directories())]
         self._session = session
         self._max_iterations = max_iterations
         self._messages: list[dict[str, Any]] = []
@@ -191,6 +193,7 @@ class ClawTurnLoop:
             allowed_read_dirs=allowed_read_dirs,
             bash_timeout=bash_timeout,
             python_path=python_path,
+            journal_path=workspace.parent / "harness" / "codegen_tool_events.jsonl",
         )
         self._permissions = SandboxPermissionPolicy(
             workspace=workspace,
@@ -213,6 +216,7 @@ class ClawTurnLoop:
         self._simulation_check_done = False
         self._plan_check_done = False
         self._exp_plan = ""
+        self._completion_recoveries = 0
 
         # Step-by-step trace log for debugging
         trace_dir = workspace.parent if workspace.parent.is_dir() else workspace
@@ -246,34 +250,26 @@ class ClawTurnLoop:
             )
 
             response = None
-            _max_retries = 5
+            from researchclaw.llm.retry import retryable_model_error
+            _max_retries = max(1, int(getattr(self._llm_config, "max_retries", 5)))
             for _retry in range(_max_retries):
                 try:
+                    self._session.llm_calls += 1
                     response = self._call_llm()
-                    # Guard against proxy returning valid JSON but empty content
-                    _usage = (response or {}).get("usage", {})
-                    _comp = _usage.get("completion_tokens", -1)
-                    if _comp == 0:
-                        self._session.log(
-                            CodegenPhase.GENERATE,
-                            f"LLM attempt {_retry + 1}/{_max_retries}: "
-                            "empty completion (0 tokens) — retrying",
-                        )
-                        response = None
-                        time.sleep(2 ** min(_retry, 3))
-                        continue
                     break
                 except Exception as exc:
                     self._session.log(
                         CodegenPhase.GENERATE,
                         f"LLM call attempt {_retry + 1}/{_max_retries} failed: {exc}",
                     )
-                    if _retry < _max_retries - 1:
-                        time.sleep(2 ** min(_retry, 3))
+                    if _retry < _max_retries - 1 and retryable_model_error(exc):
+                        delay = min(30, getattr(self._llm_config, "retry_base_delay", 1) * 2 ** min(_retry, 3))
+                        time.sleep(delay)
                     else:
-                        error_msg = f"LLM call failed after {_max_retries} retries at iteration {iter_num}: {exc}"
+                        error_msg = f"LLM call failed after {_retry + 1} attempt(s) at iteration {iter_num}: {exc}"
                         self._session.log_error(CodegenPhase.GENERATE, error_msg, exc)
                         result.errors.append(error_msg)
+                        break
             if response is None:
                 break
 
@@ -297,6 +293,17 @@ class ClawTurnLoop:
                 self._messages.append(self._build_assistant_message(response))
 
             if not tool_uses:
+                if "main.py" not in self._collect_workspace_files():
+                    if self._completion_recoveries < 2 and iter_num < self._max_iterations:
+                        self._completion_recoveries += 1
+                        self._session.log(CodegenPhase.GENERATE, "Completion rejected: main.py has not been written; requesting scoped correction")
+                        self._messages.append({"role": "user", "content":
+                            "The code-generation stage is incomplete: you have not created main.py in the current stage workspace. "
+                            "Write the executable implementation through the available tools, then verify it. "
+                            "Keep the supplied data and requested algorithms. A text description does not create a file. "
+                            "Do not replace this scientific task with a different dataset or experiment."})
+                        continue
+                    result.errors.append("Code-generation completion rejected: no main.py was written")
                 self._session.log(
                     CodegenPhase.GENERATE,
                     f"Turn {iter_num}: no tool calls — loop complete",
@@ -315,13 +322,17 @@ class ClawTurnLoop:
                 tool_id = tu.get("id", f"call_{result.tool_calls}")
                 try:
                     tool_input = json.loads(tu["function"]["arguments"])
-                except (json.JSONDecodeError, KeyError):
-                    tool_input = {}
+                    if not isinstance(tool_input, dict):
+                        tool_input = {"_invalid_arguments": True}
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    tool_input = {"_invalid_arguments": True}
 
                 result.tool_calls += 1
-                self._session.llm_calls += 1
-
-                perm_error = self._permissions.check(tool_name, tool_input)
+                try:
+                    ToolExecutor.validate_input(tool_name, tool_input)
+                    perm_error = self._permissions.check(tool_name, tool_input)
+                except (ValueError, TypeError):
+                    perm_error = None  # The executor returns a typed input error.
                 if perm_error:
                     self._session.log(
                         CodegenPhase.GENERATE,
@@ -350,7 +361,9 @@ class ClawTurnLoop:
                     f"  Executing {tool_name}({self._summarize_input(tool_name, tool_input)})",
                 )
                 tool_t0 = time.monotonic()
-                tool_result, is_error = self._executor.execute(tool_name, tool_input)
+                outcome = self._executor.execute_structured(tool_name, tool_input)
+                is_error = outcome.is_error
+                tool_result = (f"[tool_error: {outcome.error_code}]\n" if is_error else "") + outcome.content
                 tool_elapsed_ms = int((time.monotonic() - tool_t0) * 1000)
 
                 # Write to trace log
@@ -412,8 +425,8 @@ class ClawTurnLoop:
                         )
                     else:
                         correction = (
-                            "Use the exact classical estimators required by the plan on real data; "
-                            "do not introduce a pretrained neural model."
+                            "Use the exact algorithms, solvers or estimators required by the executable plan "
+                            "on the provided data, with domain-appropriate libraries."
                         )
                     self._messages.append({
                         "role": "user",
@@ -423,7 +436,7 @@ class ClawTurnLoop:
                             f"{check_result}\n\n"
                             f"{correction} "
                             "The experiment plan specifies specific methods — implement them "
-                            "using the actual ML libraries and local checkpoints. "
+                            "using the actual libraries and inputs required by its research domain. "
                             "Do NOT use brightness/contrast/augmentation as experimental conditions."
                         ),
                     })
@@ -490,58 +503,18 @@ class ClawTurnLoop:
     # ------------------------------------------------------------------
 
     def _call_llm(self) -> dict[str, Any]:
-        """Call the LLM API with tool definitions (OpenAI-compatible)."""
-        cfg = self._llm_config
-        base_url = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
-        url = f"{base_url}/chat/completions"
+        from researchclaw.llm.tool_client import call_tool_model
 
         system_prompt = self._system_prompt
         if self._use_text_tools:
             system_prompt += self._text_tool_prompt
-
-        model = cfg.primary_model
-        if self._use_text_tools:
-            _coding = getattr(cfg, "coding_model", "") or ""
-            if _coding and self._is_claude_model(_coding):
-                model = _coding
-
-        _RESPONSES_API = ("gpt-5.", "gpt-5")
-        _is_responses_model = (
-            any(model.startswith(p) for p in _RESPONSES_API)
-            and not model.startswith("gpt-5.4")
-        )
-        _tok_key = "max_output_tokens" if _is_responses_model else "max_tokens"
-        _tok_val = 8192
-
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                *self._messages,
-            ],
-            _tok_key: _tok_val,
-        }
-
-        if not self._use_text_tools:
-            body["tools"] = self._api_tools
-            body["tool_choice"] = "auto"
-
-        if any(model.startswith(p) for p in ("o3", "o4", "gpt-5")):
-            body[_tok_key] = 16384
-
-        payload = json.dumps(body).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg.api_key}",
-        }
-
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        timeout = getattr(cfg, "timeout_sec", 600)
-
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-
-        return data
+        model = self._llm_config.primary_model
+        coding = getattr(self._llm_config, "coding_model", "") or ""
+        if self._use_text_tools and coding and self._is_claude_model(coding):
+            model = coding
+        messages = [{"role": "system", "content": system_prompt}, *self._messages]
+        return call_tool_model(self._llm_config, model, messages,
+                               [] if self._use_text_tools else self._api_tools)
 
     def _parse_response(
         self, data: dict[str, Any]
@@ -655,11 +628,8 @@ class ClawTurnLoop:
 
     @staticmethod
     def _build_assistant_message(data: dict[str, Any]) -> dict[str, Any]:
-        """Build the assistant message to append to conversation history."""
-        choices = data.get("choices", [])
-        if choices:
-            return choices[0].get("message", {"role": "assistant", "content": ""})
-        return {"role": "assistant", "content": ""}
+        from researchclaw.llm.tool_client import assistant_message
+        return assistant_message(data)
 
     def _build_api_tools(self) -> list[dict[str, Any]]:
         """Convert tool specs to OpenAI-compatible tool definitions."""
@@ -767,30 +737,12 @@ class ClawTurnLoop:
     # ------------------------------------------------------------------
 
     def _plan_requires_pretrained_model(self) -> bool:
-        """Return False for explicit classical-ML-only executable plans."""
+        from researchclaw.pipeline.codegen.requirements import requires_pretrained_model
         try:
-            plan_data = yaml.safe_load(self._exp_plan or "") or {}
-        except Exception:  # noqa: BLE001
-            plan_data = {}
-        if not isinstance(plan_data, dict):
-            return True
-        proposed = plan_data.get("proposed_methods", [])
-        baselines = plan_data.get("baselines", [])
-        executable = json.dumps(
-            {"proposed_methods": proposed, "baselines": baselines},
-            ensure_ascii=False,
-        ).lower()
-        pretrained_tokens = (
-            "pretrained", "from_pretrained", "checkpoint", "diffusion", "transformer",
-            "resnet", "vit", "clip", "llm", "cnn", "lstm",
-        )
-        if any(token in executable for token in pretrained_tokens):
-            return True
-        classical_tokens = (
-            "sklearn", "sgdclassifier", "randomforestclassifier", "linear sgd",
-            "random forest", "随机森林",
-        )
-        return not (not proposed and any(token in executable for token in classical_tokens))
+            plan = yaml.safe_load(self._exp_plan or "") or {}
+        except (ValueError, yaml.YAMLError):
+            plan = {}
+        return requires_pretrained_model(plan, getattr(self, "_checkpoints_dir", ""))
 
     def _run_simulation_check(self) -> str | None:
         """Run anti-simulation checks on main.py.
@@ -874,8 +826,13 @@ class ClawTurnLoop:
                     "load_state_dict, create_model, torchvision.models)"
                 )
         else:
+            from researchclaw.pipeline.codegen.requirements import executable_requirements
             required_estimators = []
-            plan_lower = self._exp_plan.lower()
+            try:
+                plan_data = yaml.safe_load(self._exp_plan or "") or {}
+            except (ValueError, yaml.YAMLError):
+                plan_data = {}
+            plan_lower = json.dumps(executable_requirements(plan_data)).lower()
             if "sgdclassifier" in plan_lower or "linear sgd" in plan_lower:
                 required_estimators.append("SGDClassifier")
             if "randomforestclassifier" in plan_lower or "random forest" in plan_lower or "随机森林" in plan_lower:
@@ -883,7 +840,7 @@ class ClawTurnLoop:
             for estimator in required_estimators:
                 if estimator not in code:
                     violations.append(f"MISSING: Requested estimator {estimator} is not implemented")
-            if ".fit(" not in code or ".predict(" not in code:
+            if required_estimators and (".fit(" not in code or ".predict(" not in code):
                 violations.append("MISSING: Classical estimators are not both fitted and evaluated")
 
         # Check 6: Image augmentation as "experimental condition"
@@ -905,7 +862,7 @@ class ClawTurnLoop:
             + "\n\nYou MUST fix ALL violations:\n"
             "- Remove ALL try/except blocks around model code. Let errors crash.\n"
             "- Remove ALL hardcoded fallback return values.\n"
-            "- Use the correct model loading approach based on what you discovered in the workspace.\n"
+            "- Execute the algorithms and use the inputs specified by the executable plan.\n"
             "- Each condition must have genuinely different code, not copy-paste with minor changes."
         )
 
