@@ -17,7 +17,9 @@ npm --prefix frontend-web run build
 
 首次启动会创建 `emnets` 账号和随机密码，保存在 `~/.config/emnets-ra/production-login.txt`，文件权限为 0600。HTTPS 入口的访问口令与应用内登录使用这一账号。再次启动保留账号和数据。
 
-默认网关仅监听 `127.0.0.1:8080`；三个后台服务分别监听本机 9905、9906、9907。网关负责页面、WebSocket、评审流和成果下载，前端无需填写后台地址。没有口令的页面、API、WebSocket 和下载请求均由网关拒绝。
+默认网关同时提供 `127.0.0.1:8080`（供 HTTPS 隧道使用）和 `0.0.0.0:5910`（供宿主机端口映射与 IP 直连使用）；三个后台服务分别监听本机 9905、9906、9907。两个入口共用同一生产账号、科研数据与认证路由，网关负责页面、WebSocket、评审流和成果下载，前端无需填写后台地址。没有口令的页面、API、WebSocket 和下载请求均由网关拒绝。
+
+当前使用的映射是“宿主机 15910 → 容器 5910”，因此服务器入口是 `http://宿主机IP:15910/`，容器内部使用 `http://127.0.0.1:5910/` 检查；在其他宿主机上应按实际映射配置。容器监听成功只说明服务端已就绪，实际外网直连还取决于宿主机的端口映射与网络规则。开发前端移至 5911，浏览器回归测试使用独立的 25910，二者均不占用生产网关端口。
 
 评审使用 NDJSON 流，在模型长时间生成期间每 15 秒发送空闲心跳，避免将长请求误认为连接中断；心跳不计入评审结果。浏览器模型目录只显示模型名称，不返回私有服务地址。
 
@@ -43,7 +45,7 @@ npm --prefix frontend-web run build
 
 Supervisor 会重启意外退出的服务。在使用 systemd、Docker 或其他宿主管理器时，应将生产启动命令加入其启动配置；仅启动当前容器中的 Supervisor 不代表宿主重启后会自动拉起容器。
 
-可使用 `EMNETS_PRODUCTION_RUNS_DIR`、`EMNETS_GATEWAY_PORT`、`EMNETS_PRODUCTION_AGENT_PORT`、`EMNETS_PRODUCTION_RESOURCE_PORT`、`EMNETS_PRODUCTION_REVIEW_PORT` 设置隔离的目录和端口。手动安装工具时可设置 `EMNETS_CADDY_BIN`、`EMNETS_CLOUDFLARED_BIN`。
+可使用 `EMNETS_PRODUCTION_RUNS_DIR`、`EMNETS_GATEWAY_PORT`、`EMNETS_DIRECT_PORT`、`EMNETS_PRODUCTION_AGENT_PORT`、`EMNETS_PRODUCTION_RESOURCE_PORT`、`EMNETS_PRODUCTION_REVIEW_PORT` 设置隔离的目录和端口。手动安装工具时可设置 `EMNETS_CADDY_BIN`、`EMNETS_CLOUDFLARED_BIN`。
 
 ## 公网科研验收
 

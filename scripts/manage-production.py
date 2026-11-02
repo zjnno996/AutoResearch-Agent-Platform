@@ -65,12 +65,13 @@ def prepare(public: bool) -> None:
         'EMNETS_REVIEW_CACHE_DIR': str(runs/'review_cache'),
         'EMNETS_EDGE_USER': access['username'], 'EMNETS_EDGE_PASSWORD_HASH': hashed,
         'EMNETS_GATEWAY_PORT': os.environ.get('EMNETS_GATEWAY_PORT', '8080'),
+        'EMNETS_DIRECT_PORT': os.environ.get('EMNETS_DIRECT_PORT', '5910'),
         'EMNETS_PRODUCTION_AGENT_PORT': os.environ.get('EMNETS_PRODUCTION_AGENT_PORT', '9906'),
         'EMNETS_PRODUCTION_RESOURCE_PORT': os.environ.get('EMNETS_PRODUCTION_RESOURCE_PORT', '9905'),
         'EMNETS_PRODUCTION_REVIEW_PORT': os.environ.get('EMNETS_PRODUCTION_REVIEW_PORT', '9907'),
         'RESEARCHCLAW_SKIP_TORCH_INSTALL': '1',
     }
-    for key in ('EMNETS_GATEWAY_PORT', 'EMNETS_PRODUCTION_AGENT_PORT',
+    for key in ('EMNETS_GATEWAY_PORT', 'EMNETS_DIRECT_PORT', 'EMNETS_PRODUCTION_AGENT_PORT',
                 'EMNETS_PRODUCTION_RESOURCE_PORT', 'EMNETS_PRODUCTION_REVIEW_PORT'):
         if not values[key].isdigit() or not 1024 <= int(values[key]) <= 65535:
             raise SystemExit('Invalid production port: '+key)

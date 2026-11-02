@@ -12,7 +12,7 @@
 ./start-web.sh status
 ```
 
-默认访问 `http://localhost:5910/`。Web 版默认使用持久目录 `backend/runs/web-workspace/`，避免打开新版界面时自动恢复旧开发队列；原 `backend/runs/` 数据完整保留。需要使用历史账号与项目时，可显式设置 `EMNETS_RUNS_DIR=/absolute/path/to/backend/runs`。安装脚本创建项目内 `.venv-web`，不改动其他 Python 环境。已有 Python 环境可通过 `PYTHON_PATH=/path/to/python ./start-web.sh start` 使用；安装时可指定 `BOOTSTRAP_PYTHON=/path/to/python ./scripts/setup-web.sh`。
+开发环境默认访问 `http://localhost:5911/`。Web 版默认使用持久目录 `backend/runs/web-workspace/`，避免打开新版界面时自动恢复旧开发队列；原 `backend/runs/` 数据完整保留。需要使用历史账号与项目时，可显式设置 `EMNETS_RUNS_DIR=/absolute/path/to/backend/runs`。安装脚本创建项目内 `.venv-web`，不改动其他 Python 环境。已有 Python 环境可通过 `PYTHON_PATH=/path/to/python ./start-web.sh start` 使用；安装时可指定 `BOOTSTRAP_PYTHON=/path/to/python ./scripts/setup-web.sh`。
 
 新项目在首次启动 worker 时固定 `engine_snapshots/<sha256>/researchclaw`，并把运行目录及版本写入项目元数据。后续阶段与重启后的调度读取同一快照，开发目录编辑不会改变项目中途的源码身份。已有旧检查点不会被静默重新绑定；旧运行需保留原版本，或用更新后的引擎新建项目。
 
@@ -20,7 +20,7 @@
 
 | 服务 | 代码 | 默认端口 | 功能 |
 | --- | --- | ---: | --- |
-| Web | `frontend-web/` | 5910 | 登录、总览、研究、评审、技能与设置 |
+| Web（开发） | `frontend-web/` | 5911 | 登录、总览、研究、评审、技能与设置 |
 | 研究与项目服务 | `backend/services/agent_bridge.py` | 8906 | 用户认证、项目、实时事件、成果与技能目录 |
 | 评审服务 | `backend/services/review_service.py` | 8907 | 论文上传、评审、历史记录与报告导出 |
 | 资源服务 | `backend/services/resource_monitor.py` | 8905 | CPU、内存与 GPU 状态 |
@@ -63,7 +63,7 @@ npx playwright install --with-deps chromium
 npm run test:e2e
 ```
 
-浏览器测试使用独立的 15910/18906/18907 端口与临时工作空间，研究 worker 数为 0，不发起模型研究或评审请求。检查真实注册认证、用户项目概览、阶段进度、搜索、技能匹配、主题、服务健康、导出和移动端布局。截图位于 `frontend-web/artifacts/`，HTML 报告位于 `frontend-web/playwright-report/`。联调项目为测试夹具，结束后清理，不作为科研产物或 benchmark 结果。
+浏览器测试使用独立的 25910/18906/18907 端口与临时工作空间，研究 worker 数为 0，不发起模型研究或评审请求。生产网关使用容器端口 5910，由宿主机映射到 15910，测试结束不影响生产入口。检查真实注册认证、用户项目概览、阶段进度、搜索、技能匹配、主题、服务健康、导出和移动端布局。截图位于 `frontend-web/artifacts/`，HTML 报告位于 `frontend-web/playwright-report/`。联调项目为测试夹具，结束后清理，不作为科研产物或 benchmark 结果。
 
 后端验证：
 

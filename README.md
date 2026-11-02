@@ -49,7 +49,7 @@ chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/emnets-ra/provider.env"
 ./start-web.sh status
 ```
 
-浏览器访问 **http://localhost:5910/**。启动脚本会自动加载私有配置；可通过 `EMNETS_RA_ENV_FILE` 指定其他配置文件，通过 `PYTHON_PATH` 指定 Python 解释器。更多部署、接口和验证说明见 [Web 工作空间文档](docs/web-workspace.md)。
+开发环境浏览器访问 **http://localhost:5911/**。生产网关使用容器端口 5910，可由宿主机映射到 15910，详见[生产部署说明](docs/deployment.md)。启动脚本会自动加载私有配置；可通过 `EMNETS_RA_ENV_FILE` 指定其他配置文件，通过 `PYTHON_PATH` 指定 Python 解释器。更多部署、接口和验证说明见 [Web 工作空间文档](docs/web-workspace.md)。
 
 ## 项目结构
 

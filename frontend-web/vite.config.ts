@@ -8,7 +8,7 @@ const reviewPort = process.env.REVIEW_PORT || '8907'
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5910,
+    port: 5911,
     proxy: {
       '/ws/resources': {
         target: `ws://localhost:${resourcePort}`,

@@ -3,8 +3,7 @@
 	auto_https off
 }
 
-:{$EMNETS_GATEWAY_PORT:8080} {
-	bind 127.0.0.1
+(emnets_workspace) {
 	root * {$EMNETS_WEB_DIST}
 
 	basic_auth bcrypt EMNETS-RA {
@@ -55,4 +54,14 @@
 		header Cache-Control no-cache
 		file_server
 	}
+}
+
+:{$EMNETS_GATEWAY_PORT:8080} {
+	bind 127.0.0.1
+	import emnets_workspace
+}
+
+:{$EMNETS_DIRECT_PORT:5910} {
+	bind 0.0.0.0
+	import emnets_workspace
 }

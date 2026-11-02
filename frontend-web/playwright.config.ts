@@ -4,6 +4,8 @@ import { defineConfig } from "@playwright/test";
 const localBypass = [process.env.NO_PROXY, process.env.no_proxy, "localhost", "127.0.0.1", "::1"].filter(Boolean).join(",");
 process.env.NO_PROXY = localBypass;
 process.env.no_proxy = localBypass;
+// Production uses container port 5910 (mapped to host 15910); isolate test fixtures.
+const uiPort = 25910;
 
 export default defineConfig({
   testDir: "./tests",
@@ -12,7 +14,7 @@ export default defineConfig({
   expect: { timeout: 15000 },
   reporter: [["list"], ["html", { open: "never" }]],
   use: {
-    baseURL: "http://127.0.0.1:15910",
+    baseURL: `http://127.0.0.1:${uiPort}`,
     viewport: { width: 1440, height: 1000 },
     trace: "retain-on-failure",
   },
@@ -30,8 +32,8 @@ export default defineConfig({
       timeout: 90000,
     },
     {
-      command: "npm run dev -- --host 127.0.0.1 --port 15910",
-      port: 15910,
+      command: `npm run dev -- --host 127.0.0.1 --port ${uiPort}`,
+      port: uiPort,
       reuseExistingServer: !process.env.CI,
       env: {
         AGENT_BRIDGE_PORT: "18906",
