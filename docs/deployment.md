@@ -15,9 +15,9 @@ npm --prefix frontend-web run build
 .venv-web/bin/python scripts/manage-production.py url
 ```
 
-首次启动会创建 `emnets` 账号和随机密码，保存在 `~/.config/emnets-ra/production-login.txt`，文件权限为 0600。HTTPS 入口的访问口令与应用内登录使用这一账号。再次启动保留账号和数据。
+首次启动会创建 `emnets` 账号和随机密码，保存在 `~/.config/emnets-ra/production-login.txt`，文件权限为 0600。该账号用于网页内登录；访问网站直接显示登录页面，没有额外的浏览器口令弹窗。再次启动保留账号和数据。
 
-默认网关同时提供 `127.0.0.1:8080`（供 HTTPS 隧道使用）和 `0.0.0.0:5910`（供宿主机端口映射与 IP 直连使用）；三个后台服务分别监听本机 9905、9906、9907。两个入口共用同一生产账号、科研数据与认证路由，网关负责页面、WebSocket、评审流和成果下载，前端无需填写后台地址。没有口令的页面、API、WebSocket 和下载请求均由网关拒绝。
+默认网关同时提供 `127.0.0.1:8080`（供 HTTPS 隧道使用）和 `0.0.0.0:5910`（供宿主机端口映射与 IP 直连使用）；三个后台服务分别监听本机 9905、9906、9907。两个入口共用同一生产账号和科研数据，网关负责页面、WebSocket、评审流和成果下载，前端无需填写后台地址。应用原有的账号登录与科研命令认证继续生效。
 
 当前使用的映射是“宿主机 15910 → 容器 5910”，因此服务器入口是 `http://宿主机IP:15910/`，容器内部使用 `http://127.0.0.1:5910/` 检查；在其他宿主机上应按实际映射配置。容器监听成功只说明服务端已就绪，实际外网直连还取决于宿主机的端口映射与网络规则。开发前端移至 5911，浏览器回归测试使用独立的 25910，二者均不占用生产网关端口。
 
@@ -25,13 +25,13 @@ npm --prefix frontend-web run build
 
 结构化模型回复会检查完整 JSON 后的异常闭合符重复。仅在根对象完整且能够严格解析时保留其原始内容，后续科学与执行校验继续生效；不完整或无效的对象仍被拒绝。该机制不限制正常输出长度，也不降低模型推理强度。恢复事件记录在运行目录的 `traces/transport_recoveries.jsonl`；提前终止异常后缀时，供应商尚未返回完整用量的情况会明确标记。
 
-`--public` 使用 Cloudflare Quick Tunnel 生成临时 HTTPS 地址。地址在隧道进程退出后失效，重建时会变化；它适合外网联调。固定域名和长期公网服务需要配置正式隧道或现有反向代理。参见 [Cloudflare 官方说明](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)。正式反向代理应连接本机网关，保留访问认证，并支持 WebSocket 与流式响应。
+`--public` 使用 Cloudflare Quick Tunnel 生成临时 HTTPS 地址。地址在隧道进程退出后失效，重建时会变化；它适合外网联调。固定域名和长期公网服务需要配置正式隧道或现有反向代理。参见 [Cloudflare 官方说明](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)。正式反向代理应连接本机网关，并支持 WebSocket 与流式响应。
 
 ## 数据与维护
 
 - `backend/runs/production/`：生产账号、科研项目、队列和源码快照。
 - 该目录下的 `review_history/`、`review_cache/`：生产评审记录与解析缓存。
-- `.local/production/`：进程配置、口令哈希、日志和管理 socket。
+- `.local/production/`：进程配置、日志和管理 socket。
 - `~/.config/emnets-ra/production-access.json`：私有初始账号配置。
 
 上述运行目录与凭据均不提交 Git。Caddy 只提供 `frontend-web/dist/` 中的构建文件，源码、环境文件和内部日志路径不对外提供。

@@ -52,18 +52,15 @@ def prepare(public: bool) -> None:
         raise SystemExit('Saved production credentials do not match this workspace; no password was changed.')
     private_write(PRIVATE/'production-login.txt',
                   'EMNETS-RA\nUsername: '+access['username']+'\nPassword: '+access['password']+'\n'
-                  'Use this account for the HTTPS access prompt and application login.\n')
+                  'Use this account for application login.\n')
     caddy = Path(os.environ.get('EMNETS_CADDY_BIN', str(Path.home()/'.local/bin/caddy'))).resolve()
     cloudflared = Path(os.environ.get('EMNETS_CLOUDFLARED_BIN', str(Path.home()/'.local/bin/cloudflared'))).resolve()
-    hashed = subprocess.run([str(caddy), 'hash-password'], input=access['password']+'\n',
-                            text=True, capture_output=True, check=True).stdout.strip()
     values = {
         'EMNETS_CADDY_BIN': str(caddy), 'EMNETS_CLOUDFLARED_BIN': str(cloudflared),
         'EMNETS_WEB_DIST': str(ROOT/'frontend-web/dist'),
         'EMNETS_PRODUCTION_RUNS_DIR': str(runs),
         'EMNETS_REVIEW_HISTORY_DIR': str(runs/'review_history'),
         'EMNETS_REVIEW_CACHE_DIR': str(runs/'review_cache'),
-        'EMNETS_EDGE_USER': access['username'], 'EMNETS_EDGE_PASSWORD_HASH': hashed,
         'EMNETS_GATEWAY_PORT': os.environ.get('EMNETS_GATEWAY_PORT', '8080'),
         'EMNETS_DIRECT_PORT': os.environ.get('EMNETS_DIRECT_PORT', '5910'),
         'EMNETS_PRODUCTION_AGENT_PORT': os.environ.get('EMNETS_PRODUCTION_AGENT_PORT', '9906'),

@@ -6,10 +6,6 @@
 (emnets_workspace) {
 	root * {$EMNETS_WEB_DIST}
 
-	basic_auth bcrypt EMNETS-RA {
-		{$EMNETS_EDGE_USER} {$EMNETS_EDGE_PASSWORD_HASH}
-	}
-
 	header {
 		X-Content-Type-Options nosniff
 		X-Frame-Options SAMEORIGIN

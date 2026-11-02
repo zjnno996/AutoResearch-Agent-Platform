@@ -12,8 +12,7 @@ const access = JSON.parse(await readFile(process.env.EMNETS_PRODUCTION_ACCESS_FI
 const artifacts = join(root, '.local/production/verification');
 await mkdir(artifacts, { recursive: true, mode: 0o700 });
 const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ viewport: { width: 1440, height: 1000 },
-  httpCredentials: { username: access.username, password: access.password, origin: base } });
+const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));

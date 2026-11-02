@@ -15,8 +15,7 @@ const access = JSON.parse(await readFile(process.env.EMNETS_PRODUCTION_ACCESS_FI
   join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'emnets-ra/production-access.json'), 'utf8'));
 const base = process.env.EMNETS_PUBLIC_URL || run.base_url;
 const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ viewport: { width: 1440, height: 1100 },
-  httpCredentials: { username: access.username, password: access.password, origin: base } });
+const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } });
 // Automate the browser's real print document; no OS print dialog in headless QA.
 await context.addInitScript(() => { window.print = () => {}; });
 const page = await context.newPage();
