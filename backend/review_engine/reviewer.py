@@ -60,7 +60,7 @@ from .pdf_utils import (
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-HISTORY_DIR = ROOT_DIR / "backend" / "review_history"
+HISTORY_DIR = Path(os.environ.get("EMNETS_REVIEW_HISTORY_DIR", str(ROOT_DIR / "backend" / "review_history"))).expanduser()
 CHECKPOINT_DIR = ROOT_DIR / "backend" / "review_cache" / "stages"
 REVIEW_CHECKPOINT_VERSION = "configured-v9-claim-evidence-r1"
 

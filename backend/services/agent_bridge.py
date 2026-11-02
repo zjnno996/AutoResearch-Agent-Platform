@@ -6014,7 +6014,7 @@ async def main(args: argparse.Namespace):
 
     handler = lambda ws: ws_handler(state, ws)
     async with websockets.serve(
-        handler, "0.0.0.0", args.port,
+        handler, getattr(args, "host", "0.0.0.0"), args.port,
         process_request=_make_process_request(state),
         max_size=64 * 1024 * 1024,
     ):
@@ -6023,6 +6023,7 @@ async def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent Bridge v2")
+    parser.add_argument("--host", default="0.0.0.0", help="Interface for WebSocket and download endpoints")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--python", default=sys.executable)

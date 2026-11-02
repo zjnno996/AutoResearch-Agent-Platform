@@ -35,6 +35,8 @@ def provider_activity(status: str, **fields: Any) -> None:
         record["last_semantic_progress_at"] = now
     try:
         write_json(path, record)
+        if status in {'structured_response_recovered', 'structured_response_rejected'}:
+            append_jsonl(path.parent/'traces/transport_recoveries.jsonl', record)
     except OSError:
         pass  # Optional telemetry must not discard a successful paid response.
 

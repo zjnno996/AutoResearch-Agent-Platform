@@ -67,6 +67,7 @@ frontend/           历史桌面前端兼容入口
 ## 文档与评测
 
 - [Web 工作空间与部署](docs/web-workspace.md)
+- [公网部署与进程守护](docs/deployment.md)
 - [研究引擎与技能来源](docs/research-engine.md)
 - [架构与容错机制](docs/architecture-upgrade.md)
 - [ResearchClawBench 接入](docs/researchclawbench.md)

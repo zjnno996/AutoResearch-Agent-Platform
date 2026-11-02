@@ -41,3 +41,35 @@ def test_review_health_checks_the_locked_endpoint_without_exposing_credentials(m
     monkeypatch.setenv("EMNETS_API_KEY_ENV", "EMNETS_TEST_CREDENTIAL")
     monkeypatch.setenv("EMNETS_TEST_CREDENTIAL", "test-only-placeholder")
     assert _configured_review_endpoints() == ["https://private-model.example.test/v1"]
+
+
+def test_browser_model_catalog_omits_private_provider_fields(monkeypatch):
+    from services import review_service
+    monkeypatch.setattr(review_service, '_build_model_configs', lambda: None)
+    monkeypatch.setattr(review_service, 'get_preferred_review_model_name', lambda: 'Qwen3.8-27B-FP8')
+    monkeypatch.setattr(review_service, 'get_model_options', lambda: [{
+        'value': 'Qwen3.8-27B-FP8', 'label': 'Qwen3.8-27B-FP8',
+        'baseUrl': 'https://private-model.example.test/v1', 'api_key': 'private-fixture-only'}])
+    handler = object.__new__(review_service.ReviewHandler)
+    handler.path = '/api/models'
+    replies = []
+    handler._send_json = lambda status, value: replies.append((status, value))
+    handler.do_GET()
+    assert replies == [(200, {'models': [{
+        'value': 'Qwen3.8-27B-FP8', 'label': 'Qwen3.8-27B-FP8', 'baseUrl': ''}]})]
+
+
+def test_browser_health_omits_internal_endpoints_and_transport_errors(monkeypatch):
+    from services import review_service
+    monkeypatch.setattr(review_service, '_review_model_health', lambda: {
+        'available': False, 'endpoints': [{'endpoint': 'https://private-model.example.test/v1',
+                                         'error': 'private transport details', 'available': False}]})
+    handler = object.__new__(review_service.ReviewHandler)
+    handler.path = '/api/health'
+    replies = []
+    handler._send_json = lambda status, value: replies.append((status, value))
+    handler.do_GET()
+    assert replies[0][1]['reviewModel'] == {'available': False}
+    assert 'private-model' not in str(replies)
+    assert 'private-model' not in review_service._review_unavailable_message({
+        'endpoints': [{'endpoint': 'https://private-model.example.test/v1'}]})

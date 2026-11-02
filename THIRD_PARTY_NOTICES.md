@@ -17,3 +17,7 @@ Exact source metadata and file hashes are in `backend/agent/researchclaw/skills/
 ## Web dependencies and design references
 
 The Web app uses React, React Router, Vite, Lucide, html2canvas, jsPDF and Playwright; dependency versions are pinned by the npm lockfile and their licenses remain with the packages. Ant Design Pro, Shadcn Admin and TailAdmin React informed the interface organization; their complete frameworks were not copied into this project. See `docs/web-workspace.md` for source links.
+
+## Deployment tools
+
+The optional production setup uses [Caddy](https://github.com/caddyserver/caddy), [cloudflared](https://github.com/cloudflare/cloudflared), and [Supervisor](https://github.com/Supervisor/supervisor). They are installed separately; their respective upstream licenses apply. The gateway and tunnel installer pins release versions and validates the published SHA-256 digests.

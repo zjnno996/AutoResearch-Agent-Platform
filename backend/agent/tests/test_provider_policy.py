@@ -124,7 +124,7 @@ def test_zero_call_quota_counts_requests_without_stopping_them(tmp_path):
     assert budget.state['attempts']==30 and budget.reserve==0
 
 
-def test_first_artifact_uses_schema_and_scoped_correction_has_its_own_format(locked, monkeypatch, tmp_path):
+def test_artifact_schema_is_validated_locally_and_scoped_correction_is_merged(locked, monkeypatch, tmp_path):
     from researchclaw.observability.tracing import StageTrace
     from researchclaw.orchestration.compact import CompactResearch
     from researchclaw.orchestration.compact_contracts import ContractError
@@ -135,7 +135,7 @@ def test_first_artifact_uses_schema_and_scoped_correction_has_its_own_format(loc
         'llm': {'api_key_env': 'UNIT_PROVIDER_KEY'}})
     client = LLMClient(stale_config())
     observed = []
-    replies = [{'ok': False}, {'replace_fields': {'ok': True}}]
+    replies = [{'ok': 'invalid-type'}, {'replace_fields': {'ok': True}}]
     def request(req, **kwargs):
         observed.append(json.loads(req.data))
         return io.BytesIO(json.dumps({'choices': [{'message': {'content': json.dumps(replies.pop(0))}, 'finish_reason': 'stop'}]}).encode())
@@ -148,11 +148,35 @@ def test_first_artifact_uses_schema_and_scoped_correction_has_its_own_format(loc
     with StageTrace(tmp_path, tmp_path/'stage-09', 9, 'schema', 'schema-test'):
         value = engine._json('Return an artifact', validate, system='Fixture', field_repair=True, response_schema=schema)
     assert value == {'ok': True}
-    assert observed[0]['response_format']['type'] == 'json_schema'
-    assert observed[0]['response_format']['json_schema']['schema'] == schema
+    assert observed[0]['response_format'] == {'type': 'json_object'}
+    assert json.dumps(schema) in observed[0]['messages'][-1]['content']
     assert observed[1]['response_format'] == {'type': 'json_object'}
+    assert 'Artifact JSON Schema at /ok' in observed[1]['messages'][-1]['content']
     assert 'response_format' not in client.config.extra_body
     assert all('max_tokens' not in body and 'thinking_token_budget' not in body for body in observed)
+
+
+def test_scoped_schema_repair_preserves_wire_fields_before_controller_expansion(locked, monkeypatch, tmp_path):
+    from researchclaw.orchestration.compact import CompactResearch
+    from researchclaw.orchestration.compact_contracts import ContractError
+    config = RCConfig.from_dict({'project': {'name': 'anchor-fixture'},
+        'research': {'topic': 'Transport validation'}, 'runtime': {'timezone': 'UTC'},
+        'notifications': {'channel': 'console'}, 'knowledge_base': {'root': str(tmp_path/'kb')},
+        'llm': {'api_key_env': 'UNIT_PROVIDER_KEY'}})
+    client = LLMClient(stale_config())
+    replies = [{'source': {'anchor_id': 'A1'}, 'ok': False}, {'replace_fields': {'ok': True}}]
+    monkeypatch.setattr(client, 'chat', lambda *a, **kw: LLMResponse(content=json.dumps(replies.pop(0)), model='fixture'))
+    engine = CompactResearch(tmp_path, 'anchor-test', config, client)
+    schema = {'type': 'object', 'required': ['source', 'ok'], 'properties': {
+        'source': {'type': 'object', 'required': ['anchor_id'], 'properties': {
+            'anchor_id': {'enum': ['A1']}}, 'additionalProperties': False},
+        'ok': {'type': 'boolean'}}}
+    def validate(value):
+        value['source']['quote'] = 'Controller-owned exact source'
+        if not value['ok']:
+            raise ContractError('scientific defect')
+    value = engine._json('Return artifact', validate, system='Fixture', field_repair=True, response_schema=schema)
+    assert value == {'source': {'anchor_id': 'A1', 'quote': 'Controller-owned exact source'}, 'ok': True}
 
 
 def test_scoped_compiler_effort_keeps_the_scientific_client_at_xhigh(locked, monkeypatch, tmp_path):

@@ -465,6 +465,15 @@ class LLMClient:
         last_progress = 0.0
         semantic_chars = 0
         reasoning_chars = content_chars = 0
+        guard = None
+        try:
+            mode = json.loads(req.data or b'{}').get('response_format', {}).get('type')
+            if mode in {'json_object', 'json_schema'}:
+                from researchclaw.llm.structured_stream import JSONClosingRepetition
+                guard = JSONClosingRepetition()
+        except (ValueError, AttributeError, TypeError):
+            pass
+        recovery = None
         with cls._urlopen(req, timeout=timeout) as resp:
             # SSE permits data: with or without a space. Some gateways return
             # ordinary JSON even when streaming was requested.
@@ -530,9 +539,22 @@ class LLMClient:
                         last_progress = time.monotonic()
                     if delta.get("content"):
                         chunks.append(delta["content"])
+                        if guard is not None and not choice.get('finish_reason'):
+                            recovery = guard.feed(delta['content'])
+                            if recovery is not None:
+                                finish_reason = ('json_repetition_recovered' if recovery['valid_complete_root']
+                                                 else 'json_repetition_rejected')
+                                from researchclaw.observability.tracing import provider_activity
+                                provider_activity('structured_response_recovered' if recovery['valid_complete_root']
+                                                  else 'structured_response_rejected', transport_recovery=recovery)
+                                break
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
+                if recovery is not None:
+                    break
             content = "".join(chunks)
+            if recovery is not None and recovery['valid_complete_root']:
+                content = guard.complete_text
             if semantic_chars:
                 from researchclaw.observability.tracing import provider_activity
                 provider_activity('streaming', semantic_chars=semantic_chars, received_bytes=received_bytes,
@@ -550,12 +572,15 @@ class LLMClient:
                                              io.BytesIO(json.dumps(details).encode()))
             if content and not finish_reason:
                 finish_reason = "stream_interrupted"
-            return {
+            result = {
                 "choices": [{"message": {"content": content, "role": "assistant"},
                              "finish_reason": finish_reason}],
                 "model": model_name,
                 "usage": usage,
             }
+            if recovery is not None:
+                result['transport_recovery'] = recovery
+            return result
 
     @classmethod
     def _is_responses_api_model(cls, model: str) -> bool:
@@ -881,7 +906,7 @@ class LLMClient:
             completion_tokens=usage.get("completion_tokens", 0),
             total_tokens=usage.get("total_tokens", 0),
             finish_reason=choice.get("finish_reason", ""),
-            truncated=(choice.get("finish_reason", "") in {"length", "stream_interrupted"}),
+            truncated=(choice.get("finish_reason", "") in {"length", "stream_interrupted", "json_repetition_rejected"}),
             raw=data,
             request=locals().get("request_body", {}),
         )

@@ -29,7 +29,7 @@ from .dimensions import (
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-CACHE_DIR = ROOT_DIR / "backend" / "review_cache"
+CACHE_DIR = Path(os.environ.get("EMNETS_REVIEW_CACHE_DIR", str(ROOT_DIR / "backend" / "review_cache"))).expanduser()
 TEXT_CACHE_DIR = CACHE_DIR / "text"
 VISION_CACHE_DIR = CACHE_DIR / "vision"
 

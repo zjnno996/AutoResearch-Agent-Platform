@@ -223,9 +223,24 @@ class CompactResearch:
         repair_base = None
         call_budget = budget
         client = self.llm
+        from researchclaw.llm.client import LLMClient
+        from researchclaw.llm.provider_policy import provider_lock_enabled
+        if (response_schema is not None and isinstance(client, LLMClient)
+                and provider_lock_enabled() and client.config.primary_model.startswith('Qwen3.8-')):
+            # Validate locally rather than delegating this open scientific
+            # schema to a provider's grammar decoder. The production Qwen
+            # endpoint emitted an unending protocol under native json_schema.
+            # JSON mode keeps generation compatible; the same complete schema
+            # and scientific validators still gate the merged artifact.
+            from jsonschema import Draft202012Validator
+            schema_validator = Draft202012Validator(response_schema)
+            prompt += ('\nRequired artifact JSON Schema (the controller validates the complete '
+                       'artifact locally, including merged field corrections):\n'
+                       + json.dumps(response_schema, ensure_ascii=False))
+        else:
+            schema_validator = None
         # Scientific decisions stay on the configured high-effort client.
         # Once they are fixed, source/report emission is a translation task.
-        from researchclaw.llm.client import LLMClient
         system = ('You perform one controller-owned research operation. This call has no interactive tools. '
                   'Use the supplied observations, source text and execution receipts; do not claim unseen file reads. '
                   'Return the requested complete artifact JSON, never a step/analysis/tool-request envelope. '
@@ -280,17 +295,7 @@ class CompactResearch:
                     if path.is_file() and path.stat().st_size <= 8 * 1024 * 1024:
                         content.append({"type": "image_url", "image_url": {
                             "url": "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode()}})
-            active_client = client
-            if response_schema is not None and attempt == 0 and isinstance(client, LLMClient):
-                from researchclaw.llm.provider_policy import provider_lock_enabled
-                if provider_lock_enabled() and client.config.primary_model.startswith('Qwen3.8-'):
-                    import copy
-                    active_client = copy.copy(client)
-                    extra = dict(client.config.extra_body)
-                    extra['response_format'] = {'type': 'json_schema', 'json_schema': {
-                        'name': 'research_protocol', 'schema': response_schema, 'strict': False}}
-                    active_client.config = replace(client.config, extra_body=extra)
-            response = active_client.chat([{"role": "user", "content": content}],
+            response = client.chat([{"role": "user", "content": content}],
                 system=system, json_mode=True, max_tokens=call_budget, temperature=0.2)
             value = parse_object(response.content)
             if not value and getattr(response, 'finish_reason', '') != 'length' and not getattr(response, 'truncated', False):
@@ -318,8 +323,21 @@ class CompactResearch:
                     if not isinstance(value['replace_fields'], dict) or not value['replace_fields']:
                         raise ContractError('A scoped correction needs a nonempty replace_fields object')
                     value = {**repair_base, **value['replace_fields']}
-                validator(value)
-                return value
+                if schema_validator is not None:
+                    errors = list(schema_validator.iter_errors(value))
+                    if errors:
+                        error = errors[0]
+                        location = '/' + '/'.join(str(part) for part in error.absolute_path)
+                        raise ContractError(f'Artifact JSON Schema at {location}: {error.message}')
+                    # Source resolution legitimately expands anchor references.
+                    # Preserve the wire artifact for scoped format repair; do
+                    # not make controller-inserted fields fail the wire schema.
+                    import copy
+                    validated = copy.deepcopy(value)
+                else:
+                    validated = value
+                validator(validated)
+                return validated
             except (ContractError, ValueError, TypeError) as exc:
                 write_json(self.root / "compact_rejected" / f"response-{uuid.uuid4().hex}.json",
                            {"error": str(exc), "content": response.content})

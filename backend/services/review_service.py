@@ -28,6 +28,7 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from pathlib import Path
+from queue import Empty
 from socketserver import ThreadingMixIn
 from typing import Any
 
@@ -58,7 +59,7 @@ from review_engine.dimensions import (
 )
 from review_engine.export_utils import export_latex, export_pdf
 
-HISTORY_DIR = ROOT_DIR / "backend" / "review_history"
+HISTORY_DIR = Path(os.environ.get("EMNETS_REVIEW_HISTORY_DIR", str(ROOT_DIR / "backend" / "review_history"))).expanduser()
 
 # =============================================================================
 # HTTP Server
@@ -122,15 +123,7 @@ def _review_model_health(timeout_sec: float = 0.5) -> dict[str, Any]:
 
 
 def _review_unavailable_message(health: dict[str, Any]) -> str:
-    endpoint_states = health.get("endpoints", [])
-    details = "; ".join(
-        f"{item.get('endpoint', 'unknown')}: {item.get('error', 'unavailable')}"
-        for item in endpoint_states
-    )
-    return (
-        "评审模型当前不可用，本次未生成、未保存任何评审结果。"
-        + (f" 模型端点状态：{details}" if details else "")
-    )
+    return "评审模型当前不可用，本次未生成、未保存任何评审结果。请检查后端模型连接后重试。"
 
 
 def _validate_uploaded_base64(file_base64: str) -> str | None:
@@ -183,13 +176,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "status": "ok" if health["available"] else "degraded",
                 "service": "auto-review",
                 "businessService": "ok",
-                "reviewModel": health,
+                "reviewModel": {"available": health["available"]},
             })
         elif path == "/api/models":
             _build_model_configs()
             preferred = get_preferred_review_model_name()
             review_models = [
-                option for option in get_model_options()
+                {"value": option["value"], "label": option.get("label", option["value"]), "baseUrl": ""}
+                for option in get_model_options()
                 if option.get("value") == preferred
             ]
             self._send_json(200, {"models": review_models})
@@ -409,7 +403,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 min_finding_confidence=min_finding_confidence,
             )
             while True:
-                event = q.get()
+                try:
+                    event = q.get(timeout=15)
+                except Empty:
+                    _write_ndjson(self.wfile, {"type": "heartbeat"})
+                    continue
                 _write_ndjson(self.wfile, event)
                 if event["type"] == "progress":
                     pass

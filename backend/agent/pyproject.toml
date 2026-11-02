@@ -8,6 +8,7 @@ dependencies = [
     "rich>=13.0",
     "arxiv>=2.1",
     "numpy>=1.24",
+    "jsonschema>=4.23,<5",
 ]
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,7 +28,7 @@ all = [
     "matplotlib>=3.7",
     "scipy>=1.10",
 ]
-dev = ["pytest>=7.0", "httpx>=0.24", "jsonschema>=4.23,<5"]
+dev = ["pytest>=7.0", "httpx>=0.24"]
 
 [project.scripts]
 emnets-ra = "researchclaw.cli:main"

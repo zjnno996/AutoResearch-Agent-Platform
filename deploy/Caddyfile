@@ -1,0 +1,58 @@
+{
+	admin off
+	auto_https off
+}
+
+:{$EMNETS_GATEWAY_PORT:8080} {
+	bind 127.0.0.1
+	root * {$EMNETS_WEB_DIST}
+
+	basic_auth bcrypt EMNETS-RA {
+		{$EMNETS_EDGE_USER} {$EMNETS_EDGE_PASSWORD_HASH}
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy same-origin
+		-Server
+	}
+
+	@private path /.git* /.env* /.local/* /backend/* /logs/* /deploy/* /scripts/* /node_modules/* /@vite/* /src/*
+	handle @private {
+		respond "Not found" 404
+	}
+
+	handle_path /ws/agents* {
+		rewrite * /
+		reverse_proxy 127.0.0.1:{$EMNETS_PRODUCTION_AGENT_PORT:9906}
+	}
+	handle_path /ws/resources* {
+		rewrite * /
+		reverse_proxy 127.0.0.1:{$EMNETS_PRODUCTION_RESOURCE_PORT:9905}
+	}
+	handle /download/* {
+		reverse_proxy 127.0.0.1:{$EMNETS_PRODUCTION_AGENT_PORT:9906}
+	}
+	@review path /api/review* /api/models /api/health
+	handle @review {
+		reverse_proxy 127.0.0.1:{$EMNETS_PRODUCTION_REVIEW_PORT:9907} {
+			flush_interval -1
+		}
+	}
+	handle /api/* {
+		respond "Not found" 404
+	}
+	handle /healthz {
+		respond "EMNETS-RA gateway ready" 200
+	}
+	handle /assets/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+	handle {
+		try_files {path} /index.html
+		header Cache-Control no-cache
+		file_server
+	}
+}

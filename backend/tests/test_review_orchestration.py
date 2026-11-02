@@ -56,7 +56,7 @@ def test_review_model_health_reports_endpoint_failure_without_marking_business_d
     assert health["endpoints"][0]["available"] is False
     message = _review_unavailable_message(health)
     assert "未生成、未保存" in message
-    assert "127.0.0.1:1" in message
+    assert "127.0.0.1:1" not in message
 
 
 def test_same_qwen_model_keeps_independent_endpoint_failover(monkeypatch) -> None:
