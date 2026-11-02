@@ -258,7 +258,8 @@ function mdToHtml(markdown: string): RenderedMarkdown {
   return { bodyHtml, tocHtml, title: documentSections[0]?.title || '文档' }
 }
 
-export function printContentAsPdf(content: string, title: string) {
+export function printContentAsPdf(content: string, title: string,
+  options: { resolveImageUrl?: (source: string) => string } = {}) {
   if (!content || content.trim().length === 0) {
     alert('没有内容可以导出。请先等待内容生成完成。')
     return
@@ -268,6 +269,19 @@ export function printContentAsPdf(content: string, title: string) {
   if (!win) return
 
   const { bodyHtml, tocHtml, title: docTitle } = mdToHtml(content)
+  // Keep image requests inert until their project paths have been resolved.
+  // Downloads may use attachment/octet-stream headers; embedding the fetched
+  // image bytes also makes the printed PDF independent of the live server.
+  const template = document.createElement('template')
+  template.innerHTML = bodyHtml
+  for (const image of template.content.querySelectorAll('img')) {
+    const source = image.getAttribute('src') || ''
+    const alt = image.getAttribute('alt') || ''
+    for (const attribute of [...image.attributes]) image.removeAttribute(attribute.name)
+    image.alt = alt
+    image.style.maxWidth = '100%'
+    image.dataset.printSource = source
+  }
   const today = new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })
 
   win.document.write(`<!DOCTYPE html>
@@ -526,20 +540,52 @@ export function printContentAsPdf(content: string, title: string) {
   ${tocHtml}
 
   <!-- 正文 -->
-  ${bodyHtml}
+  <p id="print-status" role="status">正在准备图表与打印内容…</p>
+  ${template.innerHTML}
 
 </div>
-<script>
-  (function() {
-    // 自动打印
-    setTimeout(function() {
-      window.print();
-    }, 500);
-  })();
-<\/script>
 </body>
 </html>`)
   win.document.close()
+  void (async () => {
+    await Promise.all([...win.document.images].map(async (image) => {
+      const original = image.dataset.printSource || ''
+      const resolved = options.resolveImageUrl?.(original) || original
+      const source = new URL(resolved, window.location.href)
+      if (!['http:', 'https:', 'data:', 'blob:'].includes(source.protocol)) throw new Error('Invalid image URL')
+      if (source.origin === window.location.origin || source.protocol === 'data:') {
+        const response = await fetch(source.href, { credentials: 'same-origin', signal: AbortSignal.timeout(30000) })
+        if (!response.ok) throw new Error('Figure download failed')
+        const data = await response.blob()
+        const type = /\.png(?:$|[?#])/i.test(source.href) ? 'image/png' : data.type
+        const blob = new Blob([data], { type })
+        image.src = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(String(reader.result))
+          reader.onerror = () => reject(new Error('Figure decode failed'))
+          reader.readAsDataURL(blob)
+        })
+      } else {
+        image.src = source.href
+      }
+      await image.decode()
+      delete image.dataset.printSource
+    }))
+    await win.document.fonts.ready
+    if (win.closed) return
+    win.document.getElementById('print-status')?.remove()
+    win.document.documentElement.dataset.printState = 'ready'
+    win.focus()
+    win.print()
+  })().catch(() => {
+    if (win.closed) return
+    win.document.documentElement.dataset.printState = 'error'
+    const status = win.document.getElementById('print-status')
+    if (status) {
+      status.setAttribute('role', 'alert')
+      status.textContent = '图表加载失败，请确认产物可下载后重新导出。'
+    }
+  })
 }
 
 export function printElementAsPdf(elementId: string, title: string) {

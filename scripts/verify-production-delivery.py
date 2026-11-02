@@ -66,6 +66,15 @@ def main():
     receipt=read(project/'stage-16/experiment_provenance.json')
     assert receipt['success'] is True and receipt['returncode']==0
     work=project/'stage-11/experiment'
+    import yaml
+    plan=yaml.safe_load((project/'stage-09/exp_plan.yaml').read_text())
+    from researchclaw.orchestration.method_execution import audit_method_execution
+    method_audit=audit_method_execution(project,work,plan,receipt)
+    assert method_audit['passed'] is True,method_audit
+    methods=receipt['method_probes']
+    assert methods['passed'] is True and methods['status']=='passed'
+    assert receipt['execution_checks']['passed'] is True
+    held=read(project/methods['manifest_path'])
     for field in ('source_hashes','output_hashes'):
         assert receipt[field]
         for name,digest in receipt[field].items():
@@ -87,9 +96,8 @@ def main():
         for name,digest in receipt['source_hashes'].items():
             assert hashlib.sha256((directory/name).read_bytes()).hexdigest()==digest
         shutil.rmtree(directory/'outputs')
-        import yaml
         from researchclaw.orchestration.compact_contracts import execution_arguments
-        arguments,_=execution_arguments(yaml.safe_load((project/'stage-09/exp_plan.yaml').read_text()))
+        arguments,_=execution_arguments(plan)
         environment={k:os.environ[k] for k in ('PATH','HOME','LANG','LC_ALL') if k in os.environ}
         environment.update(OPENBLAS_NUM_THREADS='1',OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',PYTHONNOUSERSITE='1')
         started=time.monotonic()
@@ -106,6 +114,7 @@ def main():
         pages=len(pdf)
     result={'id':run['id'],'six_phases_complete':True,'scientifically_accepted':True,
             'requirements_passed':scientific['summary']['passed'],'receipt_returncode':0,
+            'held_probe_count':len(held['method_probes']),'held_method_evidence_verified':True,
             'source_hashes_verified':len(receipt['source_hashes']),'output_hashes_verified':len(receipt['output_hashes']),
             'metrics':original,'csv_rows':8,'images':images,'independent_archive_replay':True,
             'independent_replay_seconds':seconds,'pdf_pages':pages,'official_benchmark_score':None}

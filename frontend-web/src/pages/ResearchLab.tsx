@@ -263,11 +263,19 @@ function exportContextCardAsMarkdown(elementId: string, filename: string) {
   }
 }
 
-function exportContextCardAsPdf(elementId: string, title: string) {
+function exportContextCardAsPdf(elementId: string, title: string, projectId: string | null) {
   const el = document.getElementById(elementId)
   if (el) {
     const text = el.textContent || el.innerText
-    printContentAsPdf(text, title)
+    printContentAsPdf(text, title, { resolveImageUrl: (source) => {
+      if (/^(https?:|data:|blob:)/i.test(source)) return source
+      let path = source.replace(/^(?:\.\.\/)*stage-\d+\//, '').replace(/^\.\//, '')
+      if (path.startsWith('outputs/')) path = 'experiment/' + path
+      if (!projectId || path.startsWith('/') || path.split('/').includes('..') || path.includes('\\')) {
+        throw new Error('Invalid project figure path')
+      }
+      return new URL(artifactDownloadUrl(projectId, path), window.location.origin).href
+    } })
   }
 }
 
@@ -1176,7 +1184,7 @@ export default function ResearchLab() {
                       >⬇ MD</button>
                       <button
                         className="export-btn"
-                        onClick={() => exportContextCardAsPdf('synthesis-content', `综述 ${selectedProjectId}`)}
+                        onClick={() => exportContextCardAsPdf('synthesis-content', `综述 ${selectedProjectId}`, selectedProjectId)}
                         title="导出 PDF"
                       >📄 PDF</button>
                     </div>
@@ -1198,7 +1206,7 @@ export default function ResearchLab() {
                       >⬇ MD</button>
                       <button
                         className="export-btn"
-                        onClick={() => exportContextCardAsPdf('idea-content', `Idea ${selectedProjectId}`)}
+                        onClick={() => exportContextCardAsPdf('idea-content', `Idea ${selectedProjectId}`, selectedProjectId)}
                         title="导出 PDF"
                       >📄 PDF</button>
                     </div>
@@ -1239,7 +1247,7 @@ export default function ResearchLab() {
                         >⬇ MD</button>
                         <button
                           className="export-btn"
-                          onClick={() => exportContextCardAsPdf('final-paper-content', `最终稿 ${selectedProjectId}`)}
+                          onClick={() => exportContextCardAsPdf('final-paper-content', `最终稿 ${selectedProjectId}`, selectedProjectId)}
                           title="导出 PDF"
                         >📄 PDF</button>
                         <a className="export-btn" href={artifactDownloadUrl(selectedProjectId, 'paper_final.md')} target="_blank" rel="noreferrer">paper.md</a>

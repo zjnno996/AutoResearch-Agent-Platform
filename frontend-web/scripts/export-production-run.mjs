@@ -17,6 +17,8 @@ const base = process.env.EMNETS_PUBLIC_URL || run.base_url;
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({ viewport: { width: 1440, height: 1100 },
   httpCredentials: { username: access.username, password: access.password, origin: base } });
+// Automate the browser's real print document; no OS print dialog in headless QA.
+await context.addInitScript(() => { window.print = () => {}; });
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));
@@ -37,15 +39,27 @@ try {
     await download.saveAs(join(artifacts, filename));
     downloads.push(filename);
   }
-  const pdfReady = page.waitForEvent('download', { timeout: 120000 });
+  const pdfReady = page.waitForEvent('popup', { timeout: 30000 });
   await final.getByRole('button', { name: '📄 PDF', exact: true }).click();
-  await (await pdfReady).saveAs(join(artifacts, 'research-report.pdf'));
+  const printPage = await pdfReady;
+  await printPage.waitForFunction(() => document.documentElement.dataset.printState === 'ready'
+    || document.documentElement.dataset.printState === 'error', null, { timeout: 120000 });
+  expect(await printPage.locator('html').getAttribute('data-print-state')).toBe('ready');
+  const embeddedImages = await printPage.locator('img').evaluateAll(images => images.map(image => ({
+    embedded: image.src.startsWith('data:image/'), width: image.naturalWidth, height: image.naturalHeight,
+  })));
+  expect(embeddedImages.length).toBeGreaterThanOrEqual(2);
+  expect(embeddedImages.every(image => image.embedded && image.width > 0 && image.height > 0)).toBe(true);
+  await printPage.pdf({ path: join(artifacts, 'research-report.pdf'), format: 'A4',
+    printBackground: true, preferCSSPageSize: true });
+  await printPage.close();
   downloads.push('research-report.pdf');
   await page.screenshot({ path: join(artifacts, 'production-research-completed.png'), fullPage: true });
   await page.reload();
   await expect(page.locator('.research-pipeline-progress')).toContainText('6/6 阶段', { timeout: 30000 });
   expect(errors).toEqual([]);
-  const result = { base_url: base, id: run.id, downloads, browser_errors: errors, persisted_after_reload: true };
+  const result = { base_url: base, id: run.id, downloads, pdf_export: 'browser_print_popup',
+    embedded_images: embeddedImages, browser_errors: errors, persisted_after_reload: true };
   await writeFile(join(artifacts, 'downloads.json'), JSON.stringify(result, null, 2), { mode: 0o600 });
   console.log(JSON.stringify(result));
 } finally { await browser.close(); }
